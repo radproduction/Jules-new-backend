@@ -1,0 +1,34 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1769014185086,
+      "tag": "0000_tired_rocket_racer",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1769014335479,
+      "tag": "0001_worried_black_widow",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1769015934901,
+      "tag": "0002_known_jack_power",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1769029494531,
+      "tag": "0003_swift_diamondback",
+      "breakpoints": true
+    }
+  ]
+}
