@@ -75,8 +75,8 @@ export const appRouter = router({
     }),
     set: protectedProcedure
       .input(z.object({
-        price22k: z.string(),
-        price24k: z.string(),
+        price22k: z.coerce.string(),
+        price24k: z.coerce.string(),
       }))
       .mutation(async ({ input, ctx }) => {
         return await db.setGoldPrice({
