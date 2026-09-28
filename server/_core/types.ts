@@ -1,4 +1,6 @@
-export type UserRole = "user" | "admin";
+export type UserRole = "user" | "operations_finance" | "admin";
+
+export const USER_ROLES: readonly UserRole[] = ["user", "operations_finance", "admin"] as const;
 
 export type User = {
   id: number;

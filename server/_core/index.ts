@@ -7,6 +7,7 @@ import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
 import { connectDb, ensureAdminUser } from "../db";
+import { runMigrations } from "../migrations";
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -30,6 +31,7 @@ async function findAvailablePort(startPort: number = 3000): Promise<number> {
 async function startServer() {
   await connectDb();
   await ensureAdminUser();
+  await runMigrations();
 
   const app = express();
   const server = createServer(app);
@@ -67,4 +69,7 @@ async function startServer() {
   });
 }
 
-startServer().catch(console.error);
+startServer().catch(error => {
+  console.error("[startup] failed to start server", error);
+  process.exit(1);
+});

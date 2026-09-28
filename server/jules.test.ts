@@ -2,57 +2,26 @@ import { describe, expect, it, beforeEach, vi } from "vitest";
 import { appRouter } from "./routers";
 import type { TrpcContext } from "./_core/context";
 
-// Mock database functions - using actual function names from db.ts and routers.ts
-vi.mock("./db", () => ({
-  getDb: vi.fn().mockResolvedValue({}),
-  // Gold Price
-  getTodayGoldPrice: vi.fn(),
-  setGoldPrice: vi.fn(),
-  // Categories
-  getAllCategories: vi.fn(),
-  // Products
-  getAllProducts: vi.fn(),
-  getProductById: vi.fn(),
-  createProduct: vi.fn(),
-  updateProduct: vi.fn(),
-  deleteProduct: vi.fn(),
-  recalculateProductPrices: vi.fn(),
-  // Customers
-  getAllCustomers: vi.fn(),
-  getCustomerById: vi.fn(),
-  createCustomer: vi.fn(),
-  updateCustomer: vi.fn(),
-  deleteCustomer: vi.fn(),
-  // Catalogs
-  getAllCatalogs: vi.fn(),
-  getCatalogById: vi.fn(),
-  getCatalogByToken: vi.fn(),
-  getCatalogProducts: vi.fn(),
-  getCatalogLikes: vi.fn(),
-  getCatalogComments: vi.fn(),
-  createCatalog: vi.fn(),
-  updateCatalog: vi.fn(),
-  deleteCatalog: vi.fn(),
-  addProductsToCatalog: vi.fn(),
-  updateCatalogProducts: vi.fn(),
-  addCatalogLike: vi.fn(),
-  addCatalogComment: vi.fn(),
-  markCommentAsRead: vi.fn(),
-  // Orders
-  getAllOrders: vi.fn(),
-  getOrderById: vi.fn(),
-  generateOrderNumber: vi.fn(),
-  createOrder: vi.fn(),
-  updateOrder: vi.fn(),
-  deleteOrder: vi.fn(),
-  getOrderItems: vi.fn(),
-  addOrderItems: vi.fn(),
-  // Dashboard
-  getDashboardStats: vi.fn(),
-  // Users
-  upsertUser: vi.fn(),
-  getUserByOpenId: vi.fn(),
-}));
+// Auto-mock every data-layer function (models stay real but are never queried).
+vi.mock("./db", async importOriginal => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return Object.fromEntries(
+    Object.entries(actual).map(([key, value]) => [
+      key,
+      typeof value === "function" && !key.endsWith("Model") && key !== "ensureModel" ? vi.fn() : value,
+    ])
+  );
+});
+vi.mock("./financeDb", async importOriginal => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  const keep = new Set(["moneyToCents", "centsToMoney"]);
+  return Object.fromEntries(
+    Object.entries(actual).map(([key, value]) => [
+      key,
+      typeof value === "function" && !key.endsWith("Model") && !keep.has(key) ? vi.fn() : value,
+    ])
+  );
+});
 
 import * as db from "./db";
 
@@ -61,14 +30,9 @@ type AuthenticatedUser = NonNullable<TrpcContext["user"]>;
 function createAuthContext(): { ctx: TrpcContext } {
   const user: AuthenticatedUser = {
     id: 1,
-    openId: "test-user",
     email: "test@example.com",
     name: "Test User",
-    loginMethod: "manus",
     role: "admin",
-    createdAt: new Date(),
-    updatedAt: new Date(),
-    lastSignedIn: new Date(),
   };
 
   const ctx: TrpcContext = {
@@ -451,6 +415,7 @@ describe("Orders Router", () => {
   });
 
   it("should create an order", async () => {
+    vi.mocked(db.getCustomerById).mockResolvedValue({ id: 1, firstName: "John" } as any);
     vi.mocked(db.generateOrderNumber).mockResolvedValue("ORD-001");
     vi.mocked(db.createOrder).mockResolvedValue({ id: 1, orderNumber: "ORD-001" } as any);
     
@@ -468,6 +433,11 @@ describe("Orders Router", () => {
   });
 
   it("should update an order", async () => {
+    vi.mocked(db.getOrderById).mockResolvedValue({
+      order: { id: 1, status: "pending", orderNumber: "ORD-001", customerId: null, advanceCash: "0.00" },
+      customer: null,
+      catalog: null,
+    } as any);
     const mockUpdatedOrder = {
       order: { id: 1, status: "production", orderNumber: "ORD-001" },
       customer: null,
@@ -488,6 +458,7 @@ describe("Orders Router", () => {
   });
 
   it("should delete an order", async () => {
+    vi.mocked(db.getOrderAdvanceMetals).mockResolvedValue([]);
     vi.mocked(db.deleteOrder).mockResolvedValue(undefined);
     
     const { ctx } = createAuthContext();

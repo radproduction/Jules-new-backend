@@ -1,13 +1,22 @@
-import { int, mysqlEnum, mysqlTable, text, timestamp, varchar, decimal, boolean, date } from "drizzle-orm/mysql-core";
+/**
+ * JULES data contract.
+ *
+ * The runtime database is MongoDB (see server/db.ts and server/financeDb.ts).
+ * These Drizzle table definitions are kept as the single source of truth for
+ * the *row shapes* the API returns (decimals as fixed-scale strings, dates as
+ * Date objects, nullable columns as null). server/rows.ts uses them to
+ * serialize Mongo documents so the frontend receives exactly these shapes.
+ * The .sql files in this folder are legacy MySQL artifacts and are not used.
+ */
+import { AnyMySqlColumn, int, mysqlEnum, mysqlTable, text, timestamp, varchar, decimal, boolean, date } from "drizzle-orm/mysql-core";
 
-// Core user table backing auth flow
+// Core user table backing auth flow (email + password login, bcrypt hash kept server-side only)
 export const users = mysqlTable("users", {
   id: int("id").autoincrement().primaryKey(),
-  openId: varchar("openId", { length: 64 }).notNull().unique(),
   name: text("name"),
-  email: varchar("email", { length: 320 }),
-  loginMethod: varchar("loginMethod", { length: 64 }),
-  role: mysqlEnum("role", ["user", "admin"]).default("user").notNull(),
+  email: varchar("email", { length: 320 }).notNull().unique(),
+  role: mysqlEnum("role", ["user", "operations_finance", "admin"]).default("user").notNull(),
+  isActive: boolean("isActive").default(true).notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   lastSignedIn: timestamp("lastSignedIn").defaultNow().notNull(),
@@ -175,6 +184,26 @@ export const catalogComments = mysqlTable("catalog_comments", {
 export type CatalogComment = typeof catalogComments.$inferSelect;
 export type InsertCatalogComment = typeof catalogComments.$inferInsert;
 
+// Vendors - craftsmen/workshops who make jewelry
+export const vendors = mysqlTable("vendors", {
+  id: int("id").autoincrement().primaryKey(),
+  code: varchar("code", { length: 20 }).unique(), // VN 000001 format
+  name: varchar("name", { length: 255 }).notNull(),
+  phone: varchar("phone", { length: 20 }),
+  email: varchar("email", { length: 320 }),
+  address: text("address"),
+  city: varchar("city", { length: 100 }),
+  specialization: varchar("specialization", { length: 255 }), // Body Making, Stone Setting, etc.
+  isActive: boolean("isActive").default(true),
+  notes: text("notes"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  createdBy: int("createdBy").references(() => users.id),
+});
+
+export type Vendor = typeof vendors.$inferSelect;
+export type InsertVendor = typeof vendors.$inferInsert;
+
 // Orders
 export const orders = mysqlTable("orders", {
   id: int("id").autoincrement().primaryKey(),
@@ -183,12 +212,15 @@ export const orders = mysqlTable("orders", {
   customerId: int("customerId").references(() => customers.id),
   
   // Order details
+  description: text("description"),
+  comments: text("comments"),
   totalItems: int("totalItems").default(0),
   totalWeight: decimal("totalWeight", { precision: 10, scale: 3 }), // total gold weight
   totalPrice: decimal("totalPrice", { precision: 14, scale: 2 }),
+  advanceCash: decimal("advanceCash", { precision: 14, scale: 2 }).default("0"),
   
-  // Status
-  status: mysqlEnum("status", ["pending", "production", "completed", "delivered", "cancelled"]).default("pending"),
+  // Status: saved = draft, pending = confirmed awaiting production, production, completed, delivered, cancelled
+  status: mysqlEnum("status", ["saved", "pending", "production", "completed", "delivered", "cancelled"]).default("saved"),
   
   // Dates
   orderDate: timestamp("orderDate").defaultNow().notNull(),
@@ -232,16 +264,260 @@ export const collectionProducts = mysqlTable("collection_products", {
 export type CollectionProduct = typeof collectionProducts.$inferSelect;
 export type InsertCollectionProduct = typeof collectionProducts.$inferInsert;
 
-// Order Items
+// Order Items - each jewelry piece in the order (Necklace, Earrings, Baalis, etc.)
 export const orderItems = mysqlTable("order_items", {
   id: int("id").autoincrement().primaryKey(),
   orderId: int("orderId").references(() => orders.id).notNull(),
-  productId: int("productId").references(() => products.id).notNull(),
+  productId: int("productId").references(() => products.id),
+  vendorId: int("vendorId").references(() => vendors.id),
+  itemName: varchar("itemName", { length: 255 }).notNull(), // e.g. "Necklace", "Earrings", "Baalis"
   quantity: int("quantity").default(1),
+  
+  // Estimated Metal
+  estimatedMetalType: varchar("estimatedMetalType", { length: 50 }), // Gold 22k, Gold 24k
+  estimatedMetalWeight: decimal("estimatedMetalWeight", { precision: 10, scale: 3 }),
+  estimatedMetalWastage: decimal("estimatedMetalWastage", { precision: 5, scale: 2 }),
+  estimatedMetalRate: decimal("estimatedMetalRate", { precision: 12, scale: 2 }),
+  estimatedMetalValue: decimal("estimatedMetalValue", { precision: 14, scale: 2 }),
+  
+  // Estimated Gems
+  estimatedGemType: varchar("estimatedGemType", { length: 100 }),
+  estimatedGemQty: int("estimatedGemQty"),
+  estimatedGemWeight: decimal("estimatedGemWeight", { precision: 10, scale: 3 }),
+  estimatedGemRate: decimal("estimatedGemRate", { precision: 12, scale: 2 }),
+  estimatedGemCalcBy: varchar("estimatedGemCalcBy", { length: 20 }), // 'weight' or 'quantity'
+  estimatedGemValue: decimal("estimatedGemValue", { precision: 14, scale: 2 }),
+  
+  // Labour
+  estimatedLabourCharges: decimal("estimatedLabourCharges", { precision: 12, scale: 2 }).default("0"),
+  bodyMakingRateType: varchar("bodyMakingRateType", { length: 20 }).default("simple"), // simple or detailed
+  stoneSettingRateType: varchar("stoneSettingRateType", { length: 20 }).default("simple"),
+  
+  // Pricing
   unitPrice: decimal("unitPrice", { precision: 12, scale: 2 }),
   totalPrice: decimal("totalPrice", { precision: 12, scale: 2 }),
+  comments: text("comments"),
+  
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 });
 
 export type OrderItem = typeof orderItems.$inferSelect;
 export type InsertOrderItem = typeof orderItems.$inferInsert;
+
+// Order Processes - tracks each manufacturing process per order item
+export const orderProcesses = mysqlTable("order_processes", {
+  id: int("id").autoincrement().primaryKey(),
+  orderId: int("orderId").references(() => orders.id).notNull(),
+  orderItemId: int("orderItemId").references(() => orderItems.id),
+  itemName: varchar("itemName", { length: 255 }), // e.g. "Necklace"
+  processType: varchar("processType", { length: 100 }).notNull(), // Body Making, Stone Setting, Polishing, Rhodium, etc.
+  vendorId: int("vendorId").references(() => vendors.id),
+  
+  // Dates
+  startDate: date("startDate"),
+  expectedDeliveryDate: date("expectedDeliveryDate"),
+  actualDeliveryDate: date("actualDeliveryDate"),
+  
+  // Status
+  status: mysqlEnum("processStatus", ["pending", "in_progress", "complete"]).default("pending"),
+  
+  // Body Issue (metal given to vendor)
+  issueBodyWeight: decimal("issueBodyWeight", { precision: 10, scale: 3 }),
+  issueBodyUnit: varchar("issueBodyUnit", { length: 10 }).default("gm"),
+  
+  // Body Return (metal returned by vendor)
+  returnBodyMetal: varchar("returnBodyMetal", { length: 50 }), // Gold 22k, Gold 24k
+  returnBodyWeight: decimal("returnBodyWeight", { precision: 10, scale: 3 }),
+  returnBodyUnit: varchar("returnBodyUnit", { length: 10 }).default("gm"),
+  returnBodyPieces: int("returnBodyPieces").default(1),
+  
+  // Gems Issue to Vendor
+  gemsIssueType: varchar("gemsIssueType", { length: 100 }),
+  gemsIssueSource: varchar("gemsIssueSource", { length: 50 }), // Our Stock, Customer Stock
+  gemsIssueDate: date("gemsIssueDate"),
+  gemsIssueWeight: decimal("gemsIssueWeight", { precision: 10, scale: 3 }),
+  gemsIssueWeightUnit: varchar("gemsIssueWeightUnit", { length: 10 }).default("carats"),
+  gemsIssueQty: int("gemsIssueQty"),
+  
+  // Gems Return from Vendor
+  gemsReturnWeight: decimal("gemsReturnWeight", { precision: 10, scale: 3 }),
+  gemsReturnQty: int("gemsReturnQty"),
+  gemsReturnDate: date("gemsReturnDate"),
+  
+  // Labour
+  lumpSumLabour: decimal("lumpSumLabour", { precision: 12, scale: 2 }).default("0"),
+  
+  comments: text("comments"),
+  isClosed: boolean("isClosed").default(false),
+  closedDate: date("closedDate"),
+  
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+});
+
+export type OrderProcess = typeof orderProcesses.$inferSelect;
+export type InsertOrderProcess = typeof orderProcesses.$inferInsert;
+
+// Order Invoices - generated from completed orders
+export const orderInvoices = mysqlTable("order_invoices", {
+  id: int("id").autoincrement().primaryKey(),
+  invoiceNumber: varchar("invoiceNumber", { length: 50 }).unique(),
+  orderId: int("orderId").references(() => orders.id).notNull(),
+  customerId: int("customerId").references(() => customers.id),
+  
+  remarks: text("remarks"),
+  invoiceDate: date("invoiceDate"),
+  
+  // Totals
+  metalValue: decimal("metalValue", { precision: 14, scale: 2 }).default("0"),
+  stoneValue: decimal("stoneValue", { precision: 14, scale: 2 }).default("0"),
+  makingCharges: decimal("makingCharges", { precision: 14, scale: 2 }).default("0"),
+  otherCharges: decimal("otherCharges", { precision: 14, scale: 2 }).default("0"),
+  discount: decimal("discount", { precision: 14, scale: 2 }).default("0"),
+  totalAmount: decimal("totalAmount", { precision: 14, scale: 2 }).default("0"),
+  
+  status: mysqlEnum("invoiceStatus", ["draft", "sent", "paid", "cancelled"]).default("draft"),
+  
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  createdBy: int("createdBy").references(() => users.id),
+});
+
+export type OrderInvoice = typeof orderInvoices.$inferSelect;
+export type InsertOrderInvoice = typeof orderInvoices.$inferInsert;
+
+// Order Invoice Items - line items on the invoice
+export const orderInvoiceItems = mysqlTable("order_invoice_items", {
+  id: int("id").autoincrement().primaryKey(),
+  invoiceId: int("invoiceId").references(() => orderInvoices.id).notNull(),
+  itemName: varchar("itemName", { length: 255 }).notNull(), // e.g. "Necklace"
+  particular: varchar("particular", { length: 255 }), // e.g. "Our - Gold 22k", "Our - Emeralds - 01"
+  qty: int("qty"),
+  weight: decimal("weight", { precision: 10, scale: 3 }),
+  weightUnit: varchar("weightUnit", { length: 10 }).default("gm"),
+  wastage: decimal("wastage", { precision: 5, scale: 2 }),
+  netWeight: decimal("netWeight", { precision: 10, scale: 3 }),
+  rate: decimal("rate", { precision: 12, scale: 2 }),
+  calculateBy: varchar("calculateBy", { length: 20 }).default("weight"), // weight or percentage
+  amount: decimal("amount", { precision: 14, scale: 2 }),
+  sortOrder: int("sortOrder").default(0),
+  
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+
+export type OrderInvoiceItem = typeof orderInvoiceItems.$inferSelect;
+export type InsertOrderInvoiceItem = typeof orderInvoiceItems.$inferInsert;
+
+// Advance Metals - metals given in advance by customer for an order
+export const orderAdvanceMetals = mysqlTable("order_advance_metals", {
+  id: int("id").autoincrement().primaryKey(),
+  orderId: int("orderId").references(() => orders.id).notNull(),
+  itemName: varchar("itemName", { length: 255 }),
+  receivedDate: date("receivedDate"),
+  weight: decimal("weight", { precision: 10, scale: 3 }),
+  alloy: varchar("alloy", { length: 50 }),
+  netWeightRate: decimal("netWeightRate", { precision: 12, scale: 2 }),
+  value: decimal("value", { precision: 14, scale: 2 }),
+  comments: text("comments"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+
+export type OrderAdvanceMetal = typeof orderAdvanceMetals.$inferSelect;
+export type InsertOrderAdvanceMetal = typeof orderAdvanceMetals.$inferInsert;
+
+// Advance Gems - gems given in advance by customer for an order
+export const orderAdvanceGems = mysqlTable("order_advance_gems", {
+  id: int("id").autoincrement().primaryKey(),
+  orderId: int("orderId").references(() => orders.id).notNull(),
+  itemName: varchar("itemName", { length: 255 }),
+  qty: int("qty"),
+  weight: decimal("weight", { precision: 10, scale: 3 }),
+  comments: text("comments"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+
+export type OrderAdvanceGem = typeof orderAdvanceGems.$inferSelect;
+export type InsertOrderAdvanceGem = typeof orderAdvanceGems.$inferInsert;
+
+// Ledger Accounts - control/detail chart of accounts with entity-linked subledgers
+export const ledgerAccounts = mysqlTable("ledger_accounts", {
+  id: int("id").autoincrement().primaryKey(),
+  code: varchar("code", { length: 20 }).notNull().unique(),
+  title: varchar("title", { length: 255 }).notNull(),
+  description: text("description"),
+  accountClass: mysqlEnum("accountClass", ["asset", "liability", "equity", "income", "expense"]).notNull(),
+  ledgerType: mysqlEnum("ledgerType", ["control", "detail"]).default("detail").notNull(),
+  parentId: int("parentId").references((): AnyMySqlColumn => ledgerAccounts.id),
+  customerId: int("customerId").references(() => customers.id).unique(),
+  vendorId: int("vendorId").references(() => vendors.id).unique(),
+  openingBalance: decimal("openingBalance", { precision: 18, scale: 2 }).default("0").notNull(),
+  openingBalanceSide: mysqlEnum("openingBalanceSide", ["debit", "credit"]).default("debit").notNull(),
+  isInventory: boolean("isInventory").default(false).notNull(),
+  isSystem: boolean("isSystem").default(false).notNull(),
+  isActive: boolean("isActive").default(true).notNull(),
+  createdBy: int("createdBy").references(() => users.id),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+});
+
+export type LedgerAccount = typeof ledgerAccounts.$inferSelect;
+export type InsertLedgerAccount = typeof ledgerAccounts.$inferInsert;
+
+// Journal Entries - immutable headers for posted accounting transactions
+export const journalEntries = mysqlTable("journal_entries", {
+  id: int("id").autoincrement().primaryKey(),
+  entryNumber: varchar("entryNumber", { length: 50 }).notNull().unique(),
+  entryType: mysqlEnum("entryType", [
+    "cash_receipt",
+    "cash_payment",
+    "general_journal",
+    "sales_invoice",
+    "customer_advance",
+    "reversal",
+    "opening_balance",
+  ]).notNull(),
+  entryDate: date("entryDate").notNull(),
+  narration: text("narration"),
+  referenceType: varchar("referenceType", { length: 50 }),
+  referenceId: int("referenceId"),
+  status: mysqlEnum("status", ["posted", "reversed"]).default("posted").notNull(),
+  reversalOfId: int("reversalOfId").references((): AnyMySqlColumn => journalEntries.id),
+  reversedById: int("reversedById").references((): AnyMySqlColumn => journalEntries.id),
+  reversalReason: text("reversalReason"),
+  totalDebit: decimal("totalDebit", { precision: 18, scale: 2 }).notNull(),
+  totalCredit: decimal("totalCredit", { precision: 18, scale: 2 }).notNull(),
+  createdBy: int("createdBy").references(() => users.id),
+  postedAt: timestamp("postedAt").defaultNow().notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+
+export type JournalEntry = typeof journalEntries.$inferSelect;
+export type InsertJournalEntry = typeof journalEntries.$inferInsert;
+
+// Journal Lines - balanced debit and credit lines belonging to a journal entry
+export const journalLines = mysqlTable("journal_lines", {
+  id: int("id").autoincrement().primaryKey(),
+  journalEntryId: int("journalEntryId").references(() => journalEntries.id).notNull(),
+  accountId: int("accountId").references(() => ledgerAccounts.id).notNull(),
+  description: text("description"),
+  debit: decimal("debit", { precision: 18, scale: 2 }).default("0").notNull(),
+  credit: decimal("credit", { precision: 18, scale: 2 }).default("0").notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+
+export type JournalLine = typeof journalLines.$inferSelect;
+export type InsertJournalLine = typeof journalLines.$inferInsert;
+
+// Audit Log - security and accounting activity history
+export const auditLogs = mysqlTable("audit_logs", {
+  id: int("id").autoincrement().primaryKey(),
+  action: varchar("action", { length: 100 }).notNull(),
+  entityType: varchar("entityType", { length: 100 }).notNull(),
+  entityId: varchar("entityId", { length: 100 }),
+  details: text("details"),
+  createdBy: int("createdBy").references(() => users.id),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+
+export type AuditLog = typeof auditLogs.$inferSelect;
+export type InsertAuditLog = typeof auditLogs.$inferInsert;

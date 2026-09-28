@@ -1,7 +1,7 @@
 import { SignJWT, jwtVerify } from "jose";
 import bcrypt from "bcryptjs";
 import { ENV } from "./env";
-import type { SessionPayload } from "./types";
+import { USER_ROLES, type SessionPayload } from "./types";
 
 const getJwtSecret = () => {
   if (!ENV.jwtSecret) {
@@ -53,7 +53,8 @@ export async function verifySession(
     if (
       typeof userId !== "number" ||
       typeof email !== "string" ||
-      (role !== "admin" && role !== "user")
+      typeof role !== "string" ||
+      !USER_ROLES.includes(role as SessionPayload["role"])
     ) {
       return null;
     }
@@ -61,7 +62,7 @@ export async function verifySession(
     return {
       userId,
       email,
-      role,
+      role: role as SessionPayload["role"],
     };
   } catch {
     return null;
