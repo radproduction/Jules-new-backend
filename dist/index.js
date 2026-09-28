@@ -3006,7 +3006,9 @@ async function invokeLLM(params) {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: `Bearer ${target.key}`
+      authorization: `Bearer ${target.key}`,
+      // Anthropic's OpenAI-compatible endpoint also accepts its native header.
+      ...target.url.includes("anthropic.com") ? { "x-api-key": target.key, "anthropic-version": "2023-06-01" } : {}
     },
     body: JSON.stringify(payload)
   });
@@ -4212,8 +4214,11 @@ Be helpful, professional, and knowledgeable about jewelry business. Provide spec
         };
       } catch (error) {
         console.error("JulesBot chat error:", error);
+        const reason = String(error?.message || error).replace(/\s+/g, " ").slice(0, 300);
         return {
-          message: "I apologize, I'm having trouble processing your request right now. Please try again.",
+          message: `I apologize, I'm having trouble processing your request right now. Please try again.
+
+(AI service error: ${reason})`,
           catalogCreated: null,
           timestamp: (/* @__PURE__ */ new Date()).toISOString()
         };
