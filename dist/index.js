@@ -44,7 +44,11 @@ var ENV = {
   adminName: process.env.ADMIN_NAME ?? "Admin",
   isProduction: process.env.NODE_ENV === "production",
   forgeApiUrl: process.env.BUILT_IN_FORGE_API_URL ?? "",
-  forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? ""
+  forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? "",
+  // JulesBot: any OpenAI-compatible chat API (OpenAI, Gemini, Groq, OpenRouter...).
+  llmApiUrl: process.env.LLM_API_URL ?? "",
+  llmApiKey: process.env.LLM_API_KEY ?? process.env.OPENAI_API_KEY ?? "",
+  llmModel: process.env.LLM_MODEL ?? ""
 };
 
 // server/_core/notification.ts
@@ -2908,11 +2912,25 @@ var normalizeToolChoice = (toolChoice, tools) => {
   }
   return toolChoice;
 };
-var resolveApiUrl = () => ENV.forgeApiUrl && ENV.forgeApiUrl.trim().length > 0 ? `${ENV.forgeApiUrl.replace(/\/$/, "")}/v1/chat/completions` : "https://forge.manus.im/v1/chat/completions";
-var assertApiKey = () => {
-  if (!ENV.forgeApiKey) {
-    throw new Error("OPENAI_API_KEY is not configured");
+var resolveTarget = () => {
+  if (ENV.llmApiKey) {
+    const base = (ENV.llmApiUrl || "https://api.openai.com/v1").replace(/\/$/, "");
+    return {
+      url: base.endsWith("/chat/completions") ? base : `${base}/chat/completions`,
+      key: ENV.llmApiKey,
+      model: ENV.llmModel || "gpt-4o-mini",
+      manusForge: false
+    };
   }
+  if (ENV.forgeApiKey) {
+    return {
+      url: ENV.forgeApiUrl && ENV.forgeApiUrl.trim().length > 0 ? `${ENV.forgeApiUrl.replace(/\/$/, "")}/v1/chat/completions` : "https://forge.manus.im/v1/chat/completions",
+      key: ENV.forgeApiKey,
+      model: ENV.llmModel || "gemini-2.5-flash",
+      manusForge: true
+    };
+  }
+  throw new Error("JulesBot AI is not configured: set LLM_API_KEY (and optionally LLM_API_URL, LLM_MODEL)");
 };
 var normalizeResponseFormat = ({
   responseFormat,
@@ -2944,7 +2962,7 @@ var normalizeResponseFormat = ({
   };
 };
 async function invokeLLM(params) {
-  assertApiKey();
+  const target = resolveTarget();
   const {
     messages,
     tools,
@@ -2956,7 +2974,7 @@ async function invokeLLM(params) {
     response_format
   } = params;
   const payload = {
-    model: "gemini-2.5-flash",
+    model: target.model,
     messages: messages.map(normalizeMessage)
   };
   if (tools && tools.length > 0) {
@@ -2969,10 +2987,12 @@ async function invokeLLM(params) {
   if (normalizedToolChoice) {
     payload.tool_choice = normalizedToolChoice;
   }
-  payload.max_tokens = 32768;
-  payload.thinking = {
-    "budget_tokens": 128
-  };
+  if (target.manusForge) {
+    payload.max_tokens = 32768;
+    payload.thinking = { budget_tokens: 128 };
+  } else {
+    payload.max_tokens = 2048;
+  }
   const normalizedResponseFormat = normalizeResponseFormat({
     responseFormat,
     response_format,
@@ -2982,11 +3002,11 @@ async function invokeLLM(params) {
   if (normalizedResponseFormat) {
     payload.response_format = normalizedResponseFormat;
   }
-  const response = await fetch(resolveApiUrl(), {
+  const response = await fetch(target.url, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: `Bearer ${ENV.forgeApiKey}`
+      authorization: `Bearer ${target.key}`
     },
     body: JSON.stringify(payload)
   });
@@ -4075,7 +4095,7 @@ Today's Gold Prices:
 Your business at a glance:
 \u2022 ${stats.products} products
 \u2022 ${stats.customers} customers
-\u2022 ${stats.currentMonthOrders} orders this monthth
+\u2022 ${stats.currentMonthOrders} orders this month
 
 Have a productive day!`,
           goldPrice,

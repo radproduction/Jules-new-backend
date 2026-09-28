@@ -209,15 +209,33 @@ const normalizeToolChoice = (
   return toolChoice;
 };
 
-const resolveApiUrl = () =>
-  ENV.forgeApiUrl && ENV.forgeApiUrl.trim().length > 0
-    ? `${ENV.forgeApiUrl.replace(/\/$/, "")}/v1/chat/completions`
-    : "https://forge.manus.im/v1/chat/completions";
+type LlmTarget = { url: string; key: string; model: string; manusForge: boolean };
 
-const assertApiKey = () => {
-  if (!ENV.forgeApiKey) {
-    throw new Error("OPENAI_API_KEY is not configured");
+/**
+ * Prefer a directly configured OpenAI-compatible provider (LLM_API_KEY /
+ * OPENAI_API_KEY); fall back to the Manus Forge proxy for Manus-hosted builds.
+ */
+const resolveTarget = (): LlmTarget => {
+  if (ENV.llmApiKey) {
+    const base = (ENV.llmApiUrl || "https://api.openai.com/v1").replace(/\/$/, "");
+    return {
+      url: base.endsWith("/chat/completions") ? base : `${base}/chat/completions`,
+      key: ENV.llmApiKey,
+      model: ENV.llmModel || "gpt-4o-mini",
+      manusForge: false,
+    };
   }
+  if (ENV.forgeApiKey) {
+    return {
+      url: ENV.forgeApiUrl && ENV.forgeApiUrl.trim().length > 0
+        ? `${ENV.forgeApiUrl.replace(/\/$/, "")}/v1/chat/completions`
+        : "https://forge.manus.im/v1/chat/completions",
+      key: ENV.forgeApiKey,
+      model: ENV.llmModel || "gemini-2.5-flash",
+      manusForge: true,
+    };
+  }
+  throw new Error("JulesBot AI is not configured: set LLM_API_KEY (and optionally LLM_API_URL, LLM_MODEL)");
 };
 
 const normalizeResponseFormat = ({
@@ -266,7 +284,7 @@ const normalizeResponseFormat = ({
 };
 
 export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
-  assertApiKey();
+  const target = resolveTarget();
 
   const {
     messages,
@@ -280,7 +298,7 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
   } = params;
 
   const payload: Record<string, unknown> = {
-    model: "gemini-2.5-flash",
+    model: target.model,
     messages: messages.map(normalizeMessage),
   };
 
@@ -296,9 +314,11 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     payload.tool_choice = normalizedToolChoice;
   }
 
-  payload.max_tokens = 32768
-  payload.thinking = {
-    "budget_tokens": 128
+  if (target.manusForge) {
+    payload.max_tokens = 32768;
+    payload.thinking = { budget_tokens: 128 };
+  } else {
+    payload.max_tokens = 2048;
   }
 
   const normalizedResponseFormat = normalizeResponseFormat({
@@ -312,11 +332,11 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     payload.response_format = normalizedResponseFormat;
   }
 
-  const response = await fetch(resolveApiUrl(), {
+  const response = await fetch(target.url, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: `Bearer ${ENV.forgeApiKey}`,
+      authorization: `Bearer ${target.key}`,
     },
     body: JSON.stringify(payload),
   });

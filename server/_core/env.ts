@@ -7,4 +7,8 @@ export const ENV = {
   isProduction: process.env.NODE_ENV === "production",
   forgeApiUrl: process.env.BUILT_IN_FORGE_API_URL ?? "",
   forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? "",
+  // JulesBot: any OpenAI-compatible chat API (OpenAI, Gemini, Groq, OpenRouter...).
+  llmApiUrl: process.env.LLM_API_URL ?? "",
+  llmApiKey: process.env.LLM_API_KEY ?? process.env.OPENAI_API_KEY ?? "",
+  llmModel: process.env.LLM_MODEL ?? "",
 };

@@ -1265,7 +1265,7 @@ Keep the response concise, professional, and encouraging. Format it nicely with 
         return {
           greeting: `Welcome back, ${ctx.user.name || 'there'}! 👋\n\nToday's Gold Prices:\n• 22K: PKR ${goldPrice?.price22k || 'Not set'}/tola\n• 24K: PKR ${goldPrice?.price24k || 'Not set'}/tola\n\nYour business at a glance:\n• ${stats.products} products
 • ${stats.customers} customers
-• ${stats.currentMonthOrders} orders this monthth\n\nHave a productive day!`,
+• ${stats.currentMonthOrders} orders this month\n\nHave a productive day!`,
           goldPrice,
           stats,
           timestamp: new Date().toISOString(),
