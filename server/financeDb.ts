@@ -206,6 +206,7 @@ const SYSTEM_ACCOUNTS: SystemAccount[] = [
   { code: "CA000000", title: "Cash / Bank", description: "Cash and bank control account", accountClass: "asset", ledgerType: "control", openingBalanceSide: "debit", isSystem: true, isActive: true },
   { code: "CA000001", title: "Cash In Hand", description: "Primary cash account", accountClass: "asset", ledgerType: "detail", openingBalanceSide: "debit", isSystem: true, isActive: true, parentCode: "CA000000" },
   { code: "CA000002", title: "Bank Account", description: "Primary bank account", accountClass: "asset", ledgerType: "detail", openingBalanceSide: "debit", isSystem: true, isActive: true, parentCode: "CA000000" },
+  { code: "CA000003", title: "Online", description: "Online transfers / digital wallets (IBFT, JazzCash, Easypaisa)", accountClass: "asset", ledgerType: "detail", openingBalanceSide: "debit", isSystem: true, isActive: true, parentCode: "CA000000" },
   { code: "VN000000", title: "Vendor Account", description: "Vendor detail-ledger control", accountClass: "liability", ledgerType: "control", openingBalanceSide: "credit", isSystem: true, isActive: true },
   { code: "EX000000", title: "Expense", description: "Expense control account", accountClass: "expense", ledgerType: "control", openingBalanceSide: "debit", isSystem: true, isActive: true },
   { code: "EX000001", title: "Discount Allowed", description: "Customer discounts and adjustments", accountClass: "expense", ledgerType: "detail", openingBalanceSide: "debit", isSystem: true, isActive: true, parentCode: "EX000000" },
@@ -1073,6 +1074,33 @@ export async function postOrderMetalAdvance(data: { advanceId: number; customerI
       { accountId: customerAccount.id, debit: "0", credit: centsToMoney(amountCents) },
     ],
   }));
+}
+
+/** Live (non-reversed) automatic posting for a source document, with the customer it was posted to. */
+export async function getLivePosting(referenceType: string, referenceId: number) {
+  await connectDb();
+  const entry = await JournalEntryModel.findOne({ sourceKey: `${referenceType}:${referenceId}`, status: "posted" }).lean<JournalEntryDoc>();
+  if (!entry) return null;
+  const accounts = await LedgerAccountModel.find({ id: { $in: entry.lines.map(line => line.accountId) }, customerId: { $ne: null } }, { customerId: 1 }).lean<LedgerDoc[]>();
+  return {
+    entryId: entry.id,
+    amountCents: entry.totalDebitCents,
+    customerId: (accounts[0]?.customerId as number | undefined) ?? null,
+  };
+}
+
+/** Delete a cash receipt/payment by posting its reversal (posted entries are never erased). */
+export async function deleteCashVoucher(id: number, reason: string, userId: number) {
+  await connectDb();
+  const entry = await JournalEntryModel.findOne({ id }).lean<JournalEntryDoc>();
+  if (!entry) throw new Error("Voucher not found");
+  if (entry.entryType !== "cash_receipt" && entry.entryType !== "cash_payment") {
+    throw new Error("Only cash receive / payment vouchers can be deleted here");
+  }
+  if (entry.status === "reversed") throw new Error("This voucher is already deleted");
+  const reversal = await reverseJournalEntry(id, `Voucher deleted: ${reason}`, userId);
+  await createAuditLog({ action: "voucher.deleted", entityType: "journal_entry", entityId: id, details: { entryNumber: entry.entryNumber, reason }, createdBy: userId });
+  return reversal;
 }
 
 /** True when a source document (invoice, advance) has a live (non-reversed) posting. */

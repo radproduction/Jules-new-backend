@@ -8,7 +8,7 @@
  * serialize Mongo documents so the frontend receives exactly these shapes.
  * The .sql files in this folder are legacy MySQL artifacts and are not used.
  */
-import { AnyMySqlColumn, int, mysqlEnum, mysqlTable, text, timestamp, varchar, decimal, boolean, date } from "drizzle-orm/mysql-core";
+import { AnyMySqlColumn, int, mysqlEnum, mysqlTable, text, timestamp, varchar, decimal, boolean, date, json } from "drizzle-orm/mysql-core";
 
 // Core user table backing auth flow (email + password login, bcrypt hash kept server-side only)
 export const users = mysqlTable("users", {
@@ -296,6 +296,7 @@ export const orderItems = mysqlTable("order_items", {
   // Pricing
   unitPrice: decimal("unitPrice", { precision: 12, scale: 2 }),
   totalPrice: decimal("totalPrice", { precision: 12, scale: 2 }),
+  images: json("images").$type<string[]>(),
   comments: text("comments"),
   
   createdAt: timestamp("createdAt").defaultNow().notNull(),
@@ -416,6 +417,9 @@ export const orderAdvanceMetals = mysqlTable("order_advance_metals", {
   receivedDate: date("receivedDate"),
   weight: decimal("weight", { precision: 10, scale: 3 }),
   alloy: varchar("alloy", { length: 50 }),
+  wastage: decimal("wastage", { precision: 8, scale: 3 }),
+  wastageType: varchar("wastageType", { length: 20 }).default("percent"), // percent | ratti (ratti per tola)
+  netWeight: decimal("netWeight", { precision: 10, scale: 3 }),
   netWeightRate: decimal("netWeightRate", { precision: 12, scale: 2 }),
   value: decimal("value", { precision: 14, scale: 2 }),
   comments: text("comments"),

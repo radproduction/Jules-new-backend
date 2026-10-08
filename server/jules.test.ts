@@ -433,6 +433,7 @@ describe("Orders Router", () => {
   });
 
   it("should update an order", async () => {
+    vi.mocked(db.getOrderAdvanceMetals).mockResolvedValue([]);
     vi.mocked(db.getOrderById).mockResolvedValue({
       order: { id: 1, status: "pending", orderNumber: "ORD-001", customerId: null, advanceCash: "0.00" },
       customer: null,

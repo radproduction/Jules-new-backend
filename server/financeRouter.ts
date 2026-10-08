@@ -163,6 +163,16 @@ export const financeRouter = router({
         entryDate: new Date(input.entryDate),
         createdBy: ctx.user.id,
       })),
+    // "Delete" a cash receive/payment voucher: it is reversed, never erased.
+    delete: operationsFinanceProcedure
+      .input(z.object({ id: z.number().int().positive(), reason: z.string().trim().min(3).max(300) }))
+      .mutation(async ({ input, ctx }) => {
+        try {
+          return await finance.deleteCashVoucher(input.id, input.reason, ctx.user.id);
+        } catch (error) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: (error as Error).message });
+        }
+      }),
   }),
 
   journals: router({

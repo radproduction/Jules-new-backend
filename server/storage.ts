@@ -1,7 +1,9 @@
 // Preconfigured storage helpers for Manus WebDev templates
 // Uses the Biz-provided storage proxy (Authorization: Bearer <token>)
 
+import { nanoid } from 'nanoid';
 import { ENV } from './_core/env';
+import { saveFile } from './db';
 
 type StorageConfig = { baseUrl: string; apiKey: string };
 
@@ -99,4 +101,25 @@ export async function storageGet(relKey: string): Promise<{ key: string; url: st
     key,
     url: await buildDownloadUrl(baseUrl, key, apiKey),
   };
+}
+
+/**
+ * Store an uploaded image. Uses the Manus Forge storage proxy when it is
+ * configured; otherwise keeps the file in MongoDB and serves it from
+ * /api/files/:id (works on Railway/Vercel with no extra service).
+ */
+export async function storeImage(
+  folder: string,
+  data: Buffer,
+  contentType: string,
+  filename: string,
+  userId?: number
+): Promise<{ url: string }> {
+  const ext = (filename.split(".").pop() || "jpg").toLowerCase().replace(/[^a-z0-9]/g, "") || "jpg";
+  if (ENV.forgeApiUrl && ENV.forgeApiKey) {
+    const { url } = await storagePut(`${folder}/${Date.now()}-${nanoid(8)}.${ext}`, data, contentType);
+    return { url };
+  }
+  const { url } = await saveFile({ id: `${nanoid(16)}.${ext}`, filename, contentType, buffer: data, createdBy: userId });
+  return { url };
 }

@@ -246,6 +246,7 @@ const OrderItemSchema = new Schema(
     stoneSettingRateType: { type: String, default: "simple" },
     unitPrice: { type: Number },
     totalPrice: { type: Number },
+    images: { type: [String], default: undefined },
     comments: { type: String },
   },
   { ...withTimestamps, collection: "order_items" }
@@ -334,6 +335,9 @@ const OrderAdvanceMetalSchema = new Schema(
     receivedDate: { type: Date },
     weight: { type: Number },
     alloy: { type: String },
+    wastage: { type: Number },
+    wastageType: { type: String, enum: ["percent", "ratti"], default: "percent" },
+    netWeight: { type: Number },
     netWeightRate: { type: Number },
     value: { type: Number },
     comments: { type: String },
@@ -392,6 +396,20 @@ const OrderInvoiceItemSchema = new Schema(
   { ...withTimestamps, collection: "order_invoice_items" }
 );
 
+// Uploaded images (order item photos, catalog covers) stored in MongoDB so no
+// external storage service is required. Served by GET /api/files/:id.
+const StoredFileSchema = new Schema(
+  {
+    id: { type: String, required: true, unique: true, index: true },
+    filename: { type: String },
+    contentType: { type: String, required: true },
+    size: { type: Number, required: true },
+    data: { type: Buffer, required: true },
+    createdBy: { type: Number },
+  },
+  { timestamps: { createdAt: "createdAt", updatedAt: false }, collection: "files" }
+);
+
 export const UserModel = ensureModel("User", UserSchema);
 const GoldPriceModel = ensureModel("GoldPrice", GoldPriceSchema);
 const CategoryModel = ensureModel("Category", CategorySchema);
@@ -406,6 +424,7 @@ const OrderItemModel = ensureModel("OrderItem", OrderItemSchema);
 const CollectionModel = ensureModel("Collection", CollectionSchema);
 const CollectionProductModel = ensureModel("CollectionProduct", CollectionProductSchema);
 export const VendorModel = ensureModel("Vendor", VendorSchema);
+export const StoredFileModel = ensureModel("StoredFile", StoredFileSchema);
 export const OrderProcessModel = ensureModel("OrderProcess", OrderProcessSchema);
 export const OrderAdvanceMetalModel = ensureModel("OrderAdvanceMetal", OrderAdvanceMetalSchema);
 export const OrderAdvanceGemModel = ensureModel("OrderAdvanceGem", OrderAdvanceGemSchema);
@@ -1318,7 +1337,7 @@ export async function addOrderAdvanceMetal(data: Record<string, unknown>) {
   const id = await getNextSequence("order_advance_metals");
   const created = await OrderAdvanceMetalModel.create({
     id,
-    ...cleanDecimals(data, ["weight", "netWeightRate", "value"]),
+    ...cleanDecimals(data, ["weight", "wastage", "netWeight", "netWeightRate", "value"]),
   });
   return toRow(orderAdvanceMetalsTable, created.toObject());
 }
@@ -1453,4 +1472,67 @@ export async function getOrderWithDetails(orderId: number) {
     advanceGems,
     invoices,
   };
+}
+
+// ============ FILE STORAGE ============
+
+export async function saveFile(data: { id: string; filename?: string; contentType: string; buffer: Buffer; createdBy?: number }) {
+  await connectDb();
+  await StoredFileModel.create({
+    id: data.id,
+    filename: data.filename,
+    contentType: data.contentType,
+    size: data.buffer.length,
+    data: data.buffer,
+    createdBy: data.createdBy,
+  });
+  return { id: data.id, url: `/api/files/${data.id}` };
+}
+
+export async function getFile(id: string) {
+  await connectDb();
+  return StoredFileModel.findOne({ id }).lean();
+}
+
+// ============ ORDER EDITING HELPERS ============
+
+export async function updateOrderItem(id: number, data: Record<string, unknown>) {
+  await connectDb();
+  const { productId, vendorId, ...rest } = data as Record<string, any>;
+  const set: Record<string, unknown> = cleanDecimals(rest, ORDER_ITEM_DECIMALS);
+  if (vendorId !== undefined) set.vendorId = vendorId && vendorId > 0 ? vendorId : null;
+  if (productId !== undefined) set.productId = productId && productId > 0 ? productId : null;
+  await OrderItemModel.updateOne({ id }, { $set: set });
+  const item = await OrderItemModel.findOne({ id }).lean();
+  return item ? orderItemRow(item) : null;
+}
+
+export async function deleteOrderItemById(id: number) {
+  await connectDb();
+  await OrderProcessModel.deleteMany({ orderItemId: id });
+  await OrderItemModel.deleteOne({ id });
+}
+
+export async function getProcessesForItem(orderItemId: number) {
+  await connectDb();
+  return OrderProcessModel.find({ orderItemId }).lean();
+}
+
+export async function updateOrderAdvanceMetal(id: number, data: Record<string, unknown>) {
+  await connectDb();
+  await OrderAdvanceMetalModel.updateOne({ id }, { $set: cleanDecimals(data, ["weight", "wastage", "netWeight", "netWeightRate", "value"]) });
+  return getOrderAdvanceMetalById(id);
+}
+
+export async function updateOrderAdvanceGem(id: number, data: Record<string, unknown>) {
+  await connectDb();
+  await OrderAdvanceGemModel.updateOne({ id }, { $set: cleanDecimals(data, ["weight"]) });
+}
+
+/** Grams added by wastage: percent of weight, or "ratti per tola" (1 tola = 11.664 g = 96 ratti). */
+export function computeNetWeight(weight: number, wastage: number, wastageType: "percent" | "ratti") {
+  if (!Number.isFinite(weight) || weight <= 0) return 0;
+  const w = Number.isFinite(wastage) ? wastage : 0;
+  const extra = wastageType === "ratti" ? (weight / 11.664) * w * (11.664 / 96) : (weight * w) / 100;
+  return Math.round((weight + extra) * 1000) / 1000;
 }

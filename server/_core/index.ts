@@ -6,7 +6,7 @@ import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
-import { connectDb, ensureAdminUser } from "../db";
+import { connectDb, ensureAdminUser, getFile } from "../db";
 import { runMigrations } from "../migrations";
 
 function isPortAvailable(port: number): Promise<boolean> {
@@ -38,6 +38,23 @@ async function startServer() {
   // Configure body parser with larger size limit for file uploads
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
+  // Uploaded images stored in MongoDB (see storage.ts → storeImage)
+  app.get("/api/files/:id", async (req, res) => {
+    try {
+      const file = await getFile(String(req.params.id));
+      if (!file) {
+        res.status(404).send("Not found");
+        return;
+      }
+      res.setHeader("Content-Type", file.contentType as string);
+      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.send(Buffer.from((file.data as any).buffer ?? file.data));
+    } catch (error) {
+      console.error("[files] failed to serve file", error);
+      res.status(500).send("Error");
+    }
+  });
   // tRPC API
   app.use(
     "/api/trpc",

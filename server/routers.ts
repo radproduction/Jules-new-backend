@@ -3,12 +3,13 @@ import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { adminProcedure, operationsFinanceProcedure, publicProcedure, router } from "./_core/trpc";
 import { accessRouter, financeRouter } from "./financeRouter";
+import { ordersRouter, orderAdvancesHelpers } from "./ordersRouter";
 import * as financeDb from "./financeDb";
 import { z } from "zod";
 import { nanoid } from "nanoid";
 import * as db from "./db";
 import { invokeLLM } from "./_core/llm";
-import { storagePut } from "./storage";
+import { storeImage } from "./storage";
 import { TRPCError } from "@trpc/server";
 import { signSession, verifyPassword } from "./_core/auth";
 
@@ -513,282 +514,27 @@ export const appRouter = router({
   }),
 
   // Orders
-  orders: router({
-    list: operationsFinanceProcedure
-      .input(z.object({
-        status: z.string().optional(),
-        customerId: z.number().optional(),
-        month: z.number().optional(),
-        year: z.number().optional(),
-      }).optional())
-      .query(async ({ input }) => {
-        return await db.getAllOrders(input);
-      }),
-    
-    getById: operationsFinanceProcedure
-      .input(z.object({ id: z.number() }))
-      .query(async ({ input }) => {
-        const order = await db.getOrderById(input.id);
-        if (!order) return null;
-        
-        const items = await db.getOrderItems(input.id);
-        return { ...order, items };
-      }),
-    
-    create: operationsFinanceProcedure
-      .input(z.object({
-        catalogId: z.number().optional(),
-        customerId: z.number().optional(),
-        totalItems: z.number().optional(),
-        totalWeight: z.string().optional(),
-        totalPrice: z.string().optional(),
-        status: z.enum(["saved", "pending", "production", "completed", "delivered", "cancelled"]).optional(),
-        description: z.string().optional(),
-        comments: z.string().optional(),
-        advanceCash: z.string().optional(),
-        orderDate: z.string().optional(),
-        expectedDelivery: z.string().optional(),
-        notes: z.string().optional(),
-        items: z.array(z.object({
-          productId: z.number().optional(),
-          vendorId: z.number().optional(),
-          itemName: z.string(),
-          quantity: z.number(),
-          unitPrice: z.string().optional(),
-          totalPrice: z.string().optional(),
-          estimatedMetalType: z.string().optional(),
-          estimatedMetalWeight: z.string().optional(),
-          estimatedMetalWastage: z.string().optional(),
-          estimatedMetalRate: z.string().optional(),
-          estimatedMetalValue: z.string().optional(),
-          estimatedGemType: z.string().optional(),
-          estimatedGemQty: z.number().optional(),
-          estimatedGemWeight: z.string().optional(),
-          estimatedGemRate: z.string().optional(),
-          estimatedGemCalcBy: z.string().optional(),
-          estimatedGemValue: z.string().optional(),
-          estimatedLabourCharges: z.string().optional(),
-          bodyMakingRateType: z.string().optional(),
-          stoneSettingRateType: z.string().optional(),
-          comments: z.string().optional(),
-        })).optional(),
-        advanceMetals: z.array(z.object({
-          itemName: z.string().optional(),
-          receivedDate: z.string().optional(),
-          weight: z.string().optional(),
-          alloy: z.string().optional(),
-          netWeightRate: z.string().optional(),
-          value: z.string().optional(),
-          comments: z.string().optional(),
-        })).optional(),
-        advanceGems: z.array(z.object({
-          itemName: z.string().optional(),
-          qty: z.number().optional(),
-          weight: z.string().optional(),
-          comments: z.string().optional(),
-        })).optional(),
-      }))
-      .mutation(async ({ input, ctx }) => {
-        const { items, expectedDelivery, orderDate, advanceMetals, advanceGems, ...orderData } = input;
-        const orderDateValue = orderDate ? new Date(orderDate) : new Date();
-        const hasPostableAdvance =
-          Number(orderData.advanceCash || 0) > 0 ||
-          (advanceMetals ?? []).some(metal => Number(metal.value || 0) > 0);
-
-        // Validate everything before writing so a bad request never leaves a half-created order.
-        if (orderData.customerId) {
-          const customer = await db.getCustomerById(orderData.customerId);
-          if (!customer) throw new TRPCError({ code: "BAD_REQUEST", message: "Selected customer does not exist" });
-        } else if (hasPostableAdvance) {
-          throw new TRPCError({ code: "BAD_REQUEST", message: "Select a customer before recording cash or valued metal advances" });
-        }
-        for (const vendorId of Array.from(new Set((items ?? []).map(item => item.vendorId).filter(Boolean)))) {
-          const vendor = await db.getVendorById(vendorId!);
-          if (!vendor) throw new TRPCError({ code: "BAD_REQUEST", message: `Vendor #${vendorId} does not exist` });
-        }
-        if (orderData.customerId && hasPostableAdvance) {
-          const codes = [
-            ...(Number(orderData.advanceCash || 0) > 0 ? ["CA000001"] : []),
-            ...((advanceMetals ?? []).some(metal => Number(metal.value || 0) > 0) ? ["ST000001"] : []),
-          ];
-          await guard(() => financeDb.ensurePostingReady(orderData.customerId!, ctx.user.id, codes));
-        }
-
-        const orderNumber = await db.generateOrderNumber();
-        const order = await db.createOrder({
-          ...orderData,
-          orderNumber,
-          orderDate: orderDateValue,
-          expectedDelivery: expectedDelivery ? new Date(expectedDelivery) : null,
-          createdBy: ctx.user.id,
-        });
-        
-        if (items && items.length > 0) {
-          const createdItems = await db.addOrderItems(order.id, items);
-          for (const item of createdItems) {
-            if (item.vendorId) {
-              await db.createOrderProcess({
-                orderId: order.id,
-                orderItemId: item.id,
-                itemName: item.itemName,
-                processType: "Body Making",
-                vendorId: item.vendorId,
-                startDate: orderDateValue,
-                expectedDeliveryDate: expectedDelivery ? new Date(expectedDelivery) : null,
-                status: "pending",
-                comments: "Vendor assigned from Sales Order",
-              });
-            }
-          }
-        }
-
-        if (advanceMetals?.length) {
-          for (const metal of advanceMetals) {
-            const created = await db.addOrderAdvanceMetal({
-              ...metal,
-              orderId: order.id,
-              receivedDate: metal.receivedDate ? new Date(metal.receivedDate) : null,
-            });
-            if (order.customerId && Number(metal.value || 0) > 0) {
-              await financeDb.postOrderMetalAdvance({
-                advanceId: created.id,
-                customerId: order.customerId,
-                value: metal.value || "0",
-                entryDate: metal.receivedDate ? new Date(metal.receivedDate) : orderDateValue,
-                description: `${metal.itemName || "Metal"} advance for ${order.orderNumber}`,
-                userId: ctx.user.id,
-              });
-            }
-          }
-        }
-
-        if (advanceGems?.length) {
-          for (const gem of advanceGems) {
-            await db.addOrderAdvanceGem({ ...gem, orderId: order.id });
-          }
-        }
-
-        if (order.customerId && Number(order.advanceCash || 0) > 0) {
-          await financeDb.postOrderCashAdvance({
-            orderId: order.id,
-            customerId: order.customerId,
-            amount: order.advanceCash || "0",
-            entryDate: orderDateValue,
-            userId: ctx.user.id,
-          });
-        }
-        
-        return order;
-      }),
-    
-    update: operationsFinanceProcedure
-      .input(z.object({
-        id: z.number(),
-        status: z.enum(["saved", "pending", "production", "completed", "delivered", "cancelled"]).optional(),
-        expectedDelivery: z.string().optional(),
-        notes: z.string().optional(),
-        description: z.string().optional(),
-        comments: z.string().optional(),
-        advanceCash: z.string().optional(),
-        totalItems: z.number().optional(),
-        totalWeight: z.string().optional(),
-        totalPrice: z.string().optional(),
-        customerId: z.number().optional(),
-      }))
-      .mutation(async ({ input, ctx }) => {
-        const { id, expectedDelivery, ...data } = input;
-        const existing = await db.getOrderById(id);
-        if (!existing) throw new TRPCError({ code: "NOT_FOUND", message: "Order not found" });
-        const current = existing.order;
-        const hasCashPosting = await financeDb.hasActivePosting("order_cash_advance", id);
-
-        if (data.customerId !== undefined && data.customerId !== current.customerId) {
-          const customer = await db.getCustomerById(data.customerId);
-          if (!customer) throw new TRPCError({ code: "BAD_REQUEST", message: "Selected customer does not exist" });
-          const invoices = await db.getOrderInvoices(id);
-          const metalPostings = await Promise.all(
-            (await db.getOrderAdvanceMetals(id)).map(metal => financeDb.hasActivePosting("order_metal_advance", metal.id))
-          );
-          if (hasCashPosting || invoices.length > 0 || metalPostings.some(Boolean)) {
-            throw new TRPCError({ code: "BAD_REQUEST", message: "Customer cannot be changed after advances or invoices have been posted" });
-          }
-        }
-
-        if (data.advanceCash !== undefined && hasCashPosting) {
-          const posted = await financeDb.getSourceEntry("order_cash_advance", id);
-          if (posted && Number(posted.totalDebit) !== Number(data.advanceCash || 0)) {
-            throw new TRPCError({
-              code: "BAD_REQUEST",
-              message: "The cash advance is already posted to the ledger. Record extra receipts with a Cash Receipt voucher, or reverse the posting first.",
-            });
-          }
-        }
-        
-        const updateData: Record<string, unknown> = { ...data };
-        if (expectedDelivery) {
-          updateData.expectedDelivery = new Date(expectedDelivery);
-        }
-        if (data.status === 'completed') {
-          updateData.completedDate = new Date();
-        }
-        
-        const updated = await db.updateOrder(id, updateData);
-
-        // Post a newly entered cash advance (idempotent per order).
-        const customerId = data.customerId ?? current.customerId;
-        const advanceCash = data.advanceCash ?? current.advanceCash;
-        if (!hasCashPosting && customerId && Number(advanceCash || 0) > 0) {
-          await financeDb.postOrderCashAdvance({
-            orderId: id,
-            customerId,
-            amount: String(advanceCash),
-            entryDate: current.orderDate ?? new Date(),
-            userId: ctx.user.id,
-          });
-        }
-        return updated;
-      }),
-    
-    delete: operationsFinanceProcedure
-      .input(z.object({ id: z.number() }))
-      .mutation(async ({ input }) => {
-        const metals = await db.getOrderAdvanceMetals(input.id);
-        const postings = await Promise.all([
-          financeDb.hasActivePosting("order_cash_advance", input.id),
-          ...metals.map(metal => financeDb.hasActivePosting("order_metal_advance", metal.id)),
-        ]);
-        if (postings.some(Boolean)) {
-          throw new TRPCError({
-            code: "BAD_REQUEST",
-            message: "This order has posted advances. Reverse the ledger entries before deleting, or cancel the order instead.",
-          });
-        }
-        await guard(() => db.deleteOrder(input.id));
-        return { success: true };
-      }),
-  }),
+  orders: ordersRouter,
 
   // File Upload
   upload: router({
-    image: adminProcedure
+    // Order item photos (Operations & Finance) and catalog covers (Super Admin).
+    image: operationsFinanceProcedure
       .input(z.object({
         base64: z.string(),
-        filename: z.string(),
+        filename: z.string().max(200),
         contentType: z.string(),
       }))
-      .mutation(async ({ input }) => {
-        // Decode base64 to buffer
+      .mutation(async ({ input, ctx }) => {
+        if (!/^image\/(png|jpe?g|webp|gif)$/.test(input.contentType)) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "Only PNG, JPG, WEBP or GIF images can be uploaded" });
+        }
         const base64Data = input.base64.replace(/^data:[^;]+;base64,/, '');
         const buffer = Buffer.from(base64Data, 'base64');
-        
-        // Generate unique filename
-        const ext = input.filename.split('.').pop() || 'jpg';
-        const uniqueFilename = `catalog-covers/${Date.now()}-${nanoid(8)}.${ext}`;
-        
-        // Upload to S3
-        const { url } = await storagePut(uniqueFilename, buffer, input.contentType);
-        
-        return { url };
+        if (buffer.length > 5 * 1024 * 1024) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "Image is larger than 5 MB" });
+        }
+        return storeImage("uploads", buffer, input.contentType, input.filename, ctx.user.id);
       }),
   }),
 
@@ -948,9 +694,11 @@ export const appRouter = router({
       .input(z.object({
         orderId: z.number(),
         itemName: z.string().optional(),
-        receivedDate: z.string().optional(),
+        receivedDate: optionalDate,
         weight: z.string().optional(),
         alloy: z.string().optional(),
+        wastage: z.string().optional(),
+        wastageType: z.enum(["percent", "ratti"]).optional(),
         netWeightRate: z.string().optional(),
         value: z.string().optional(),
         comments: z.string().optional(),
@@ -958,35 +706,20 @@ export const appRouter = router({
       .mutation(async ({ input, ctx }) => {
         const existing = await db.getOrderById(input.orderId);
         if (!existing) throw new TRPCError({ code: "BAD_REQUEST", message: "Order not found" });
-        const customerId = existing.order.customerId;
-        if (Number(input.value || 0) > 0 && !customerId) {
+        const { orderId, ...metal } = input;
+        const data = orderAdvancesHelpers.normalizeMetal(metal);
+        if (Number(data.value || 0) > 0 && !existing.order.customerId) {
           throw new TRPCError({ code: "BAD_REQUEST", message: "Assign a customer to the order before recording a valued metal advance" });
         }
-        const data: Record<string, unknown> = { ...input };
-        if (input.receivedDate) data.receivedDate = new Date(input.receivedDate);
-        const created = await db.addOrderAdvanceMetal(data);
-        if (customerId && Number(input.value || 0) > 0) {
-          await financeDb.postOrderMetalAdvance({
-            advanceId: created.id,
-            customerId,
-            value: input.value || "0",
-            entryDate: input.receivedDate ? new Date(input.receivedDate) : new Date(),
-            description: `${input.itemName || "Metal"} advance for ${existing.order.orderNumber}`,
-            userId: ctx.user.id,
-          });
-        }
+        const created = await db.addOrderAdvanceMetal({ ...data, orderId });
+        await orderAdvancesHelpers.syncOrderPostings(orderId, ctx.user, "Metal advance added");
         return created;
       }),
     
     deleteMetal: operationsFinanceProcedure
       .input(z.object({ id: z.number() }))
-      .mutation(async ({ input }) => {
-        if (await financeDb.hasActivePosting("order_metal_advance", input.id)) {
-          throw new TRPCError({
-            code: "BAD_REQUEST",
-            message: "This metal advance is posted to the ledger. Reverse its journal entry before deleting it.",
-          });
-        }
+      .mutation(async ({ input, ctx }) => {
+        await orderAdvancesHelpers.reverseMetalAdvance(input.id, ctx.user, "Metal advance deleted");
         await db.deleteOrderAdvanceMetal(input.id);
         return { success: true };
       }),
@@ -1400,8 +1133,10 @@ Be helpful, professional, and knowledgeable about jewelry business. Provide spec
           };
         } catch (error) {
           console.error('JulesBot chat error:', error);
+          // JulesBot is Super Admin only, so surface a short technical reason to help fix configuration.
+          const reason = String((error as Error)?.message || error).replace(/\s+/g, " ").slice(0, 300);
           return {
-            message: "I apologize, I'm having trouble processing your request right now. Please try again.",
+            message: `I apologize, I'm having trouble processing your request right now. Please try again.\n\n(AI service error: ${reason})`,
             catalogCreated: null,
             timestamp: new Date().toISOString(),
           };

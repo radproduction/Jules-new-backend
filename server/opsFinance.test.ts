@@ -11,7 +11,7 @@ vi.mock("./db", async importOriginal => {
   return Object.fromEntries(
     Object.entries(actual).map(([key, value]) => [
       key,
-      typeof value === "function" && !key.endsWith("Model") && key !== "ensureModel" ? vi.fn() : value,
+      typeof value === "function" && !key.endsWith("Model") && key !== "ensureModel" && key !== "computeNetWeight" ? vi.fn() : value,
     ])
   );
 });
@@ -52,6 +52,7 @@ beforeEach(() => {
   });
   vi.mocked(financeDb.hasActivePosting).mockResolvedValue(false);
   vi.mocked(financeDb.getSourceEntry).mockResolvedValue(null);
+  vi.mocked(financeDb.getLivePosting).mockResolvedValue(null);
   vi.mocked(db.getOrderAdvanceMetals).mockResolvedValue([]);
   vi.mocked(db.getOrderInvoices).mockResolvedValue([]);
 });
@@ -121,6 +122,8 @@ describe("sales orders", () => {
   });
 
   it("creates the vendor production process and posts advances", async () => {
+    vi.mocked(db.getOrderById).mockResolvedValue(existingOrder({ advanceCash: "25000.00", status: "pending" }) as any);
+    vi.mocked(db.getOrderAdvanceMetals).mockResolvedValue([{ id: 55, itemName: "Old gold", value: "40000.00", receivedDate: null }] as any);
     await caller("operations_finance").orders.create({
       customerId: 5,
       orderDate: "2026-09-28",
@@ -130,8 +133,8 @@ describe("sales orders", () => {
       advanceGems: [{ itemName: "Ruby", qty: 2 }],
     });
     expect(db.createOrderProcess).toHaveBeenCalledWith(expect.objectContaining({ orderItemId: 100, vendorId: 3, processType: "Body Making" }));
-    expect(financeDb.postOrderCashAdvance).toHaveBeenCalledWith(expect.objectContaining({ orderId: 10, customerId: 5, amount: "25000" }));
-    expect(financeDb.postOrderMetalAdvance).toHaveBeenCalledWith(expect.objectContaining({ advanceId: 55, value: "40000" }));
+    expect(financeDb.postOrderCashAdvance).toHaveBeenCalledWith(expect.objectContaining({ orderId: 10, customerId: 5, amount: "25000.00" }));
+    expect(financeDb.postOrderMetalAdvance).toHaveBeenCalledWith(expect.objectContaining({ advanceId: 55, value: "40000.00" }));
     expect(db.addOrderAdvanceGem).toHaveBeenCalledWith(expect.objectContaining({ orderId: 10, itemName: "Ruby" }));
   });
 
@@ -154,12 +157,73 @@ describe("sales orders", () => {
     expect(db.createOrder).not.toHaveBeenCalled();
   });
 
-  it("does not let a posted cash advance be silently changed", async () => {
-    vi.mocked(db.getOrderById).mockResolvedValue(existingOrder({ advanceCash: "25000.00" }) as any);
-    vi.mocked(financeDb.hasActivePosting).mockResolvedValue(true);
-    vi.mocked(financeDb.getSourceEntry).mockResolvedValue({ id: 1, totalDebit: "25000.00", status: "posted" } as any);
-    await expect(caller("operations_finance").orders.update({ id: 10, advanceCash: "30000" })).rejects.toThrow(/already posted/);
-    expect(db.updateOrder).not.toHaveBeenCalled();
+  it("re-posts a changed cash advance as reversal + new entry", async () => {
+    vi.mocked(db.getOrderById)
+      .mockResolvedValueOnce(existingOrder({ advanceCash: "25000.00", status: "pending" }) as any)
+      .mockResolvedValue(existingOrder({ advanceCash: "30000.00", status: "pending" }) as any);
+    vi.mocked(financeDb.getLivePosting).mockImplementation(async (type: string) =>
+      type === "order_cash_advance" ? { entryId: 9, amountCents: 2500000, customerId: 5 } : null);
+    await caller("operations_finance").orders.update({ id: 10, advanceCash: "30000" });
+    expect(financeDb.reverseJournalEntry).toHaveBeenCalledWith(9, expect.stringContaining("cash advance"), 1);
+    expect(financeDb.postOrderCashAdvance).toHaveBeenCalledWith(expect.objectContaining({ amount: "30000.00" }));
+  });
+
+  it("cancelling reverses advances and keeps no live postings", async () => {
+    vi.mocked(db.getOrderById)
+      .mockResolvedValueOnce(existingOrder({ advanceCash: "25000.00", status: "pending" }) as any)
+      .mockResolvedValue(existingOrder({ advanceCash: "25000.00", status: "cancelled" }) as any);
+    vi.mocked(db.getOrderAdvanceMetals).mockResolvedValue([{ id: 55, value: "40000.00" }] as any);
+    vi.mocked(financeDb.getLivePosting).mockImplementation(async (type: string) =>
+      type === "order_cash_advance" ? { entryId: 9, amountCents: 2500000, customerId: 5 }
+        : type === "order_metal_advance" ? { entryId: 10, amountCents: 4000000, customerId: 5 } : null);
+    await caller("operations_finance").orders.update({ id: 10, status: "cancelled" });
+    expect(financeDb.reverseJournalEntry).toHaveBeenCalledWith(9, expect.any(String), 1);
+    expect(financeDb.reverseJournalEntry).toHaveBeenCalledWith(10, expect.any(String), 1);
+    expect(financeDb.postOrderCashAdvance).not.toHaveBeenCalled();
+  });
+
+  it("only a Super Admin can cancel an order with a posted invoice", async () => {
+    vi.mocked(db.getOrderById).mockResolvedValue(existingOrder({ status: "completed" }) as any);
+    vi.mocked(db.getOrderInvoices).mockResolvedValue([{ id: 77, status: "sent", invoiceNumber: "INV1" }] as any);
+    vi.mocked(financeDb.getLivePosting).mockImplementation(async (type: string) =>
+      type === "order_invoice" ? { entryId: 900, amountCents: 100, customerId: 5 } : null);
+    await expect(caller("operations_finance").orders.update({ id: 10, status: "cancelled" })).rejects.toThrow(/Super Admin/);
+    await caller("admin").orders.update({ id: 10, status: "cancelled" });
+    expect(db.updateInvoice).toHaveBeenCalledWith(77, { status: "cancelled" });
+    expect(financeDb.reverseJournalEntry).toHaveBeenCalledWith(900, expect.stringContaining("Order cancelled"), 1);
+  });
+
+  it("edit is blocked for items/amounts while an invoice exists", async () => {
+    vi.mocked(db.getOrderById).mockResolvedValue(existingOrder({ status: "pending" }) as any);
+    vi.mocked(db.getCustomerById).mockResolvedValue({ id: 5 } as any);
+    vi.mocked(db.getOrderInvoices).mockResolvedValue([{ id: 77, status: "sent" }] as any);
+    await expect(caller("operations_finance").orders.edit({ id: 10, customerId: 5, advanceCash: "0", items: [baseItem] }))
+      .rejects.toThrow(/Cancel the invoice first/);
+  });
+
+  it("edit refuses to remove an item already in production", async () => {
+    vi.mocked(db.getOrderById).mockResolvedValue(existingOrder({ status: "pending" }) as any);
+    vi.mocked(db.getCustomerById).mockResolvedValue({ id: 5 } as any);
+    vi.mocked(db.getOrderItemsRaw).mockResolvedValue([{ id: 100, itemName: "Necklace" }] as any);
+    vi.mocked(db.getProcessesForItem).mockResolvedValue([{ id: 1, status: "in_progress" }] as any);
+    await expect(caller("operations_finance").orders.edit({ id: 10, customerId: 5, advanceCash: "0", items: [] }))
+      .rejects.toThrow(/in production/);
+    expect(db.deleteOrderItemById).not.toHaveBeenCalled();
+  });
+
+  it("computes advance metal net weight from % and ratti-per-tola wastage", async () => {
+    vi.mocked(db.getOrderById).mockResolvedValue(existingOrder({ advanceCash: "0.00", status: "pending" }) as any);
+    await caller("operations_finance").orders.create({
+      customerId: 5,
+      advanceMetals: [
+        { itemName: "Gold 22k", weight: "11.664", wastage: "4", wastageType: "ratti", netWeightRate: "1000" },
+        { itemName: "Gold 21k", weight: "10", wastage: "5", wastageType: "percent" },
+      ],
+    });
+    const calls = vi.mocked(db.addOrderAdvanceMetal).mock.calls.map(c => c[0] as any);
+    // 1 tola + 4 ratti = 11.664 + 4 × 0.1215 = 12.15 g; value = 12.15 × 1000
+    expect(calls[0]).toMatchObject({ netWeight: "12.15", value: "12150.00", wastageType: "ratti" });
+    expect(calls[1]).toMatchObject({ netWeight: "10.5", wastageType: "percent" });
   });
 
   it("blocks deleting an order with posted advances", async () => {

@@ -337,6 +337,8 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${target.key}`,
+      // Anthropic's OpenAI-compatible endpoint also accepts its native header.
+      ...(target.url.includes("anthropic.com") ? { "x-api-key": target.key, "anthropic-version": "2023-06-01" } : {}),
     },
     body: JSON.stringify(payload),
   });
