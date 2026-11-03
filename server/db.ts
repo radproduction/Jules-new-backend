@@ -1421,10 +1421,6 @@ export async function getProductCollections(productId: number) {
 
 // ============ VENDOR FUNCTIONS ============
 
-function escapeRegex(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 export async function getAllVendors(filters?: { search?: string; isActive?: boolean }) {
   await connectDb();
   const query: Record<string, unknown> = {};
