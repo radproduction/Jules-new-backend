@@ -168,6 +168,34 @@ describe("Products Router", () => {
     ).rejects.toThrow(/UPLOAD_DIR/);
   });
 
+  it("should refuse a multi-photo product import when no image storage folder is configured", async () => {
+    const { ctx } = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+    await expect(
+      caller.products.importGroup({
+        folder: "Coloured Stones",
+        sourceKey: "Coloured Stones/a.jpeg",
+        photoKeys: ["Coloured Stones/a.jpeg", "Coloured Stones/b.jpeg"],
+        imageUrls: ["/api/files/aaaaaaaaaaaaaaaa.jpg", "/api/files/bbbbbbbbbbbbbbbb.jpg"],
+        thumbnailUrl: "/api/files/cccccccccccccccc.jpg",
+      })
+    ).rejects.toThrow(/UPLOAD_DIR/);
+  });
+
+  it("should reject image URLs that are not uploaded files", async () => {
+    const { ctx } = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+    await expect(
+      caller.products.importGroup({
+        folder: "Coloured Stones",
+        sourceKey: "Coloured Stones/a.jpeg",
+        photoKeys: ["Coloured Stones/a.jpeg"],
+        imageUrls: ["https://evil.example/x.jpg"],
+        thumbnailUrl: "/api/files/cccccccccccccccc.jpg",
+      })
+    ).rejects.toThrow();
+  });
+
   it("should list products", async () => {
     const mockProducts = [
       {

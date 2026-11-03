@@ -145,6 +145,8 @@ const ProductSchema = new Schema(
     images: { type: String },
     primaryImage: { type: String },
     thumbnail: { type: String },
+    aiNamed: { type: Boolean },
+    sourcePhotos: { type: [String], default: undefined }, // every imported photo key used by this product
     sourceKey: { type: String, index: { unique: true, sparse: true } },
     basePrice: { type: Number },
     totalPrice: { type: Number },
@@ -815,10 +817,19 @@ export async function deleteProduct(id: number) {
 
 // ============ BULK PRODUCT IMPORT ============
 
+/** Every photo key already imported (product keys plus all their photos). */
 export async function listProductSourceKeys(): Promise<string[]> {
   await connectDb();
-  const rows = await ProductModel.find({ sourceKey: { $exists: true, $ne: null } }, { sourceKey: 1 }).lean<Array<{ sourceKey: string }>>();
-  return rows.map(row => row.sourceKey);
+  const rows = await ProductModel.find(
+    { sourceKey: { $exists: true, $ne: null } },
+    { sourceKey: 1, sourcePhotos: 1 }
+  ).lean<Array<{ sourceKey: string; sourcePhotos?: string[] }>>();
+  const keys = new Set<string>();
+  for (const row of rows) {
+    keys.add(row.sourceKey);
+    for (const photo of row.sourcePhotos ?? []) keys.add(photo);
+  }
+  return Array.from(keys);
 }
 
 export async function getProductBySourceKey(sourceKey: string) {
@@ -1703,6 +1714,35 @@ export async function saveFile(data: { id: string; filename?: string; contentTyp
     createdBy: data.createdBy,
   });
   return { id: data.id, url: `/api/files/${data.id}` };
+}
+
+/** Bytes of an uploaded file from its /api/files/:id URL (disk first, then MongoDB). */
+export async function readStoredFile(url: string): Promise<Buffer | null> {
+  const id = url.split("/").pop() ?? "";
+  const diskPath = diskFilePath(id);
+  if (diskPath) {
+    try {
+      return await fs.promises.readFile(diskPath);
+    } catch {
+      // fall through to MongoDB
+    }
+  }
+  const file = await getFile(id);
+  return file ? Buffer.from(((file as any).data as any).buffer ?? (file as any).data) : null;
+}
+
+/** Imported products whose name was generated from the folder, not from the photo. */
+export async function listProductsNeedingAiName(limit: number) {
+  await connectDb();
+  return ProductModel.find({ sourceKey: { $exists: true }, aiNamed: { $ne: true } })
+    .sort({ id: 1 })
+    .limit(limit)
+    .lean<Array<Record<string, any>>>();
+}
+
+export async function countProductsNeedingAiName() {
+  await connectDb();
+  return ProductModel.countDocuments({ sourceKey: { $exists: true }, aiNamed: { $ne: true } });
 }
 
 /** Best-effort removal of uploaded files by their /api/files/:id URL. */

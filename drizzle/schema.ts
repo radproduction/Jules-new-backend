@@ -87,6 +87,8 @@ export const products = mysqlTable("products", {
   images: text("images"), // JSON array
   primaryImage: text("primaryImage"),
   thumbnail: text("thumbnail"), // small preview image for grids
+  aiNamed: boolean("aiNamed"), // name/description written by Claude from the photo
+  sourcePhotos: json("sourcePhotos"), // imported photo keys used by this product
   sourceKey: varchar("sourceKey", { length: 255 }), // bulk import key ("Folder/file.jpeg"), prevents duplicates
   
   // Pricing

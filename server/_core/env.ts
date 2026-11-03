@@ -14,4 +14,7 @@ export const ENV = {
   // Folder on the Railway volume where uploaded/imported images are stored (e.g. /data/uploads).
   // When empty, images are stored in MongoDB instead.
   uploadDir: process.env.UPLOAD_DIR ?? "",
+  // Claude vision names imported product photos (optional).
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? "",
+  anthropicModel: process.env.ANTHROPIC_MODEL || "claude-haiku-5-5",
 };

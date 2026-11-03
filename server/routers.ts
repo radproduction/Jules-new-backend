@@ -15,6 +15,7 @@ import { signSession, verifyPassword } from "./_core/auth";
 import { fetchLiveGoldRate } from "./goldRate";
 import { WHITE_GOLD_KARATS } from "../shared/pricing";
 import { ENV } from "./_core/env";
+import { describeJewelry, visionConfigured, type JewelryDescription } from "./_core/vision";
 
 /** Run a data-layer call and surface domain errors (validation/integrity) as 400s. */
 async function guard<T>(fn: () => Promise<T>): Promise<T> {
@@ -93,6 +94,18 @@ function skuPrefix(name: string) {
     .map(word => word[0]!.toUpperCase())
     .join("");
   return (letters || "PR").slice(0, 3);
+}
+
+/** Product fields from Claude's reading of the photo. */
+function aiFields(ai: JewelryDescription) {
+  const coloured = ai.stones.filter(stone => !/diamond/i.test(stone));
+  return {
+    name: ai.name,
+    description: ai.description || undefined,
+    stoneType: coloured.length ? coloured.map(s => s[0]!.toUpperCase() + s.slice(1)).join(", ") : undefined,
+    goldKarat: ai.metal === "white" ? ("white" as const) : undefined,
+    aiNamed: true,
+  };
 }
 
 /** "Diamond Rings" -> "Diamond Ring", "Gold Karas" -> "Gold Kara". */
@@ -260,6 +273,116 @@ export const appRouter = router({
         return await db.updateProduct(id, data);
       }),
 
+    /**
+     * Bulk import, one product with several photos. Photos are uploaded first
+     * (upload.image); this creates the product, its category and collection, and
+     * asks Claude to name it from up to 3 of its photos. Idempotent per sourceKey.
+     */
+    importGroup: adminProcedure
+      .input(z.object({
+        folder: z.string().trim().min(1).max(100),
+        sourceKey: z.string().trim().min(1).max(255),
+        photoKeys: z.array(z.string().trim().min(1).max(255)).min(1).max(60),
+        imageUrls: z.array(z.string().regex(/^\/api\/files\/[A-Za-z0-9_.-]+$/)).min(1).max(60),
+        thumbnailUrl: z.string().regex(/^\/api\/files\/[A-Za-z0-9_.-]+$/),
+        name: z.string().trim().max(120).optional(),
+      }))
+      .mutation(async ({ input, ctx }) => {
+        if (!ENV.uploadDir) {
+          throw new TRPCError({
+            code: "PRECONDITION_FAILED",
+            message: "Image storage is not configured on the server (set UPLOAD_DIR to the Railway volume path).",
+          });
+        }
+        const existing = await db.getProductBySourceKey(input.sourceKey);
+        if (existing) return { status: "skipped" as const, productId: existing.id as number, name: existing.name as string };
+
+        const category = await db.findOrCreateCategory(input.folder);
+        const collection = await db.findOrCreateCollection(input.folder, ctx.user.id);
+        const sequence = await db.nextProductNumberInCategory(category.id);
+        const number = String(sequence).padStart(4, "0");
+
+        let named: Partial<ReturnType<typeof aiFields>> = {};
+        if (!input.name && visionConfigured()) {
+          try {
+            const photos = (await Promise.all(input.imageUrls.slice(0, 3).map(url => db.readStoredFile(url)))).filter(
+              (bytes): bytes is Buffer => !!bytes
+            );
+            if (photos.length) named = aiFields(await describeJewelry(photos.map(bytes => bytes.toString("base64")), category.name));
+          } catch (error) {
+            console.warn("[import] AI naming failed, using folder name", (error as Error).message);
+          }
+        }
+
+        const [primaryImage, ...rest] = input.imageUrls;
+        try {
+          const product = await db.createProduct({
+            name: `${singular(category.name)} ${number}`,
+            ...named,
+            ...(input.name ? { name: input.name } : {}),
+            sku: `${skuPrefix(category.name)}-${number}`,
+            categoryId: category.id,
+            primaryImage,
+            images: rest.join(","),
+            thumbnail: input.thumbnailUrl,
+            sourceKey: input.sourceKey,
+            sourcePhotos: input.photoKeys,
+            isActive: true,
+            createdBy: ctx.user.id,
+          });
+          await db.addProductsToCollection(collection.id, [product.id]);
+          return { status: "created" as const, productId: product.id, name: String((product as any).name) };
+        } catch (error) {
+          if ((error as { code?: number })?.code === 11000) {
+            const again = await db.getProductBySourceKey(input.sourceKey);
+            if (again) return { status: "skipped" as const, productId: again.id as number, name: again.name as string };
+          }
+          throw error;
+        }
+      }),
+
+    /** How many imported products still have a folder-based name, and whether AI naming is set up. */
+    aiNamingStatus: adminProcedure.query(async () => {
+      return { configured: visionConfigured(), pending: await db.countProductsNeedingAiName() };
+    }),
+
+    /** Name a few already-imported products from their photos (the page calls this in a loop). */
+    aiNameBatch: adminProcedure
+      .input(z.object({ size: z.number().int().min(1).max(10).default(5) }))
+      .mutation(async ({ input }) => {
+        if (!visionConfigured()) {
+          throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Set ANTHROPIC_API_KEY on the server to name products from their photos." });
+        }
+        const products = await db.listProductsNeedingAiName(input.size);
+        let named = 0;
+        const failed: string[] = [];
+        await Promise.all(
+          products.map(async product => {
+            const url = product.thumbnail || product.primaryImage;
+            const bytes = url ? await db.readStoredFile(url) : null;
+            try {
+              if (!bytes) throw new Error("photo not found");
+              const category = product.categoryId ? (await db.getProductById(product.id))?.category : null;
+              const fields = aiFields(await describeJewelry(bytes.toString("base64"), category?.name ?? "Jewellery"));
+              // Keep anything already entered by hand.
+              await db.updateProduct(product.id, {
+                name: fields.name,
+                aiNamed: true,
+                ...(product.description ? {} : { description: fields.description }),
+                ...(product.stoneType ? {} : { stoneType: fields.stoneType }),
+                ...(product.goldKarat ? {} : { goldKarat: fields.goldKarat }),
+              });
+              named++;
+            } catch (error) {
+              failed.push(`${product.sku || product.id}: ${(error as Error).message}`);
+              // Do not retry the same photo forever.
+              if (!bytes) await db.updateProduct(product.id, { aiNamed: true });
+            }
+          })
+        );
+        return { named, failed, remaining: await db.countProductsNeedingAiName() };
+      }),
+
     /** sourceKeys of products already imported (lets the importer skip them). */
     importedKeys: adminProcedure.query(async () => {
       return await db.listProductSourceKeys();
@@ -293,9 +416,21 @@ export const appRouter = router({
 
         const sequence = await db.nextProductNumberInCategory(category.id);
         const number = String(sequence).padStart(4, "0");
+
+        // Name the piece from its photo; fall back to the folder name if Claude is unavailable.
+        let named: Partial<ReturnType<typeof aiFields>> = {};
+        if (visionConfigured()) {
+          try {
+            named = aiFields(await describeJewelry(input.thumbnail, category.name));
+          } catch (error) {
+            console.warn("[import] AI naming failed, using folder name", (error as Error).message);
+          }
+        }
+
         try {
           const product = await db.createProduct({
             name: `${singular(category.name)} ${number}`,
+            ...named,
             sku: `${skuPrefix(category.name)}-${number}`,
             categoryId: category.id,
             primaryImage: image.url,
