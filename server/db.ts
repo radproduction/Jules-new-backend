@@ -17,6 +17,10 @@ import {
   vendors as vendorsTable,
 } from "../drizzle/schema";
 import { num, toRow, toRowOrNull, toRows } from "./rows";
+import { pakistanDayRange } from "./goldRate";
+import { calculateProductPrice, type GoldRates } from "../shared/pricing";
+import fs from "fs";
+import path from "path";
 
 let connected = false;
 
@@ -62,6 +66,21 @@ export async function getNextSequence(name: string): Promise<number> {
   }
 }
 
+/**
+ * Next id that is also guaranteed to be above every existing document id
+ * (protects collections whose rows were seeded without the counter).
+ */
+async function nextSafeId(model: mongoose.Model<any>, counterName: string): Promise<number> {
+  const next = await getNextSequence(counterName);
+  const top = await model.findOne({}, { id: 1 }).sort({ id: -1 }).lean<{ id?: number }>();
+  if (top?.id && next <= top.id) {
+    const fixed = top.id + 1;
+    await Counter.updateOne({ name: counterName }, { $max: { value: fixed } });
+    return fixed;
+  }
+  return next;
+}
+
 const withTimestamps = {
   timestamps: { createdAt: "createdAt", updatedAt: "updatedAt" },
 };
@@ -85,6 +104,10 @@ const GoldPriceSchema = new Schema(
     priceDate: { type: Date, required: true },
     price22k: { type: Number, required: true },
     price24k: { type: Number, required: true },
+    whiteGoldPrice: { type: Number },
+    whiteGoldKarat: { type: String },
+    marketReference24k: { type: Number },
+    source: { type: String, enum: ["live", "manual"], default: "manual" },
     createdBy: { type: Number },
   },
   { ...withTimestamps, collection: "gold_prices" }
@@ -106,7 +129,7 @@ const ProductSchema = new Schema(
     description: { type: String },
     sku: { type: String },
     categoryId: { type: Number },
-    goldKarat: { type: String, enum: ["22k", "24k"] },
+    goldKarat: { type: String, enum: ["22k", "24k", "white"] },
     goldWeight: { type: Number },
     goldWastage: { type: Number },
     goldRateAtOrder: { type: Number },
@@ -121,6 +144,8 @@ const ProductSchema = new Schema(
     stonePrice: { type: Number },
     images: { type: String },
     primaryImage: { type: String },
+    thumbnail: { type: String },
+    sourceKey: { type: String, index: { unique: true, sparse: true } },
     basePrice: { type: Number },
     totalPrice: { type: Number },
     isActive: { type: Boolean, default: true },
@@ -576,35 +601,42 @@ export async function setUserFields(
 }
 
 // Gold Price functions
+// "Today" is the current day in Pakistan time (the server runs in UTC).
 export async function getTodayGoldPrice() {
   await connectDb();
-  const start = new Date();
-  start.setHours(0, 0, 0, 0);
-  const end = new Date();
-  end.setHours(23, 59, 59, 999);
-
+  const { start, end } = pakistanDayRange();
   const price = await GoldPriceModel.findOne({ priceDate: { $gte: start, $lte: end } })
-    .sort({ priceDate: -1 })
+    .sort({ priceDate: -1, updatedAt: -1 })
     .lean();
   return toRowOrNull(goldPricesTable, price);
 }
 
 export async function getLatestGoldPrice() {
   await connectDb();
-  return toRowOrNull(goldPricesTable, await GoldPriceModel.findOne({}).sort({ priceDate: -1 }).lean());
+  return toRowOrNull(goldPricesTable, await GoldPriceModel.findOne({}).sort({ priceDate: -1, updatedAt: -1 }).lean());
 }
 
-export async function setGoldPrice(data: { price22k: string; price24k: string; userId?: number }) {
+export async function setGoldPrice(data: {
+  price22k: number;
+  price24k: number;
+  whiteGoldPrice?: number | null;
+  whiteGoldKarat?: string | null;
+  marketReference24k?: number | null;
+  source?: "live" | "manual";
+  userId?: number;
+}) {
   await connectDb();
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-
+  const { start } = pakistanDayRange();
   const existing = await getTodayGoldPrice();
 
-  const payload = {
-    price22k: Number(data.price22k),
-    price24k: Number(data.price24k),
+  const payload: Record<string, unknown> = {
+    price22k: data.price22k,
+    price24k: data.price24k,
+    whiteGoldPrice: data.whiteGoldPrice ?? null,
+    whiteGoldKarat: data.whiteGoldKarat ?? null,
+    source: data.source ?? "manual",
   };
+  if (data.marketReference24k != null) payload.marketReference24k = data.marketReference24k;
 
   if (existing) {
     await GoldPriceModel.updateOne({ id: existing.id }, { $set: payload });
@@ -614,11 +646,77 @@ export async function setGoldPrice(data: { price22k: string; price24k: string; u
   const id = await getNextSequence("gold_prices");
   const created = await GoldPriceModel.create({
     id,
-    priceDate: today,
+    priceDate: start,
     ...payload,
     createdBy: data.userId,
   });
   return toRow(goldPricesTable, created.toObject());
+}
+
+/** Most recent saved rate that recorded the live market reference (for the local premium). */
+export async function getLatestRateWithMarketReference() {
+  await connectDb();
+  return GoldPriceModel.findOne({ marketReference24k: { $gt: 0 } })
+    .sort({ priceDate: -1, updatedAt: -1 })
+    .lean<{ price24k?: number; marketReference24k?: number }>();
+}
+
+/** Latest saved rates in the shape the pricing helpers expect. */
+export async function getCurrentGoldRates(): Promise<GoldRates | null> {
+  await connectDb();
+  const latest = await GoldPriceModel.findOne({}).sort({ priceDate: -1, updatedAt: -1 }).lean<Record<string, any>>();
+  if (!latest) return null;
+  return {
+    price22k: latest.price22k,
+    price24k: latest.price24k,
+    whiteGoldPrice: latest.whiteGoldPrice,
+    whiteGoldKarat: latest.whiteGoldKarat,
+  };
+}
+
+/** Price a product document with the given (or latest) gold rates. */
+export function priceProduct(product: Record<string, any>, rates: GoldRates | null) {
+  return calculateProductPrice(
+    {
+      goldKarat: product.goldKarat,
+      goldWeight: product.goldWeight,
+      makingCharges: product.makingCharges,
+      makingChargesType: product.makingChargesType,
+      diamondWeight: product.diamondWeight,
+      diamondRate: product.diamondRate,
+      diamondPrice: product.diamondPrice,
+      stoneWeight: product.stoneWeight,
+      stoneRate: product.stoneRate,
+      stonePrice: product.stonePrice,
+    },
+    rates
+  );
+}
+
+/**
+ * Re-price every product from the latest gold rate. Called whenever the daily
+ * rate is saved so products, catalogs and new orders all show current prices.
+ */
+export async function recalculateAllProductPrices(): Promise<{ updated: number; total: number }> {
+  await connectDb();
+  const rates = await getCurrentGoldRates();
+  const products = await ProductModel.find({}).lean<Array<Record<string, any>>>();
+  const ops: any[] = [];
+  for (const product of products) {
+    const { goldValue, total } = priceProduct(product, rates);
+    // Keep a manually entered price for products that have no pricing inputs at all.
+    if (total === null) continue;
+    if (product.totalPrice === total && product.basePrice === goldValue) continue;
+    ops.push({ updateOne: { filter: { id: product.id }, update: { $set: { totalPrice: total, basePrice: goldValue } } } });
+  }
+  for (let i = 0; i < ops.length; i += 500) {
+    await ProductModel.bulkWrite(ops.slice(i, i + 500), { ordered: false });
+  }
+  return { updated: ops.length, total: products.length };
+}
+
+export function escapeRegex(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 // Categories
@@ -633,7 +731,10 @@ export async function getAllProducts(filters?: { categoryId?: number; search?: s
   const query: Record<string, unknown> = {};
   if (filters?.categoryId) query.categoryId = filters.categoryId;
   if (filters?.isActive !== undefined) query.isActive = filters.isActive;
-  if (filters?.search) query.name = { $regex: filters.search, $options: "i" };
+  if (filters?.search) {
+    const pattern = escapeRegex(filters.search.trim());
+    query.$or = [{ name: { $regex: pattern, $options: "i" } }, { sku: { $regex: pattern, $options: "i" } }];
+  }
 
   const products = await ProductModel.find(query)
     .sort({ createdAt: -1 })
@@ -661,20 +762,120 @@ export async function getProductById(id: number) {
 
 export async function createProduct(data: Record<string, unknown>) {
   await connectDb();
-  const id = await getNextSequence("products");
-  const created = await ProductModel.create({ id, ...data });
-  return { id, ...data, createdAt: created.createdAt, updatedAt: created.updatedAt };
+  const id = await nextSafeId(ProductModel, "products");
+  const { goldValue, total } = priceProduct(data, await getCurrentGoldRates());
+  // Products with nothing to price from keep a manually entered price.
+  const doc = total === null ? { ...data } : { ...data, basePrice: goldValue, totalPrice: total };
+  const created = await ProductModel.create({ id, ...doc });
+  return { id, ...doc, createdAt: created.createdAt, updatedAt: created.updatedAt };
 }
 
+/** Fields set to null are removed from the document ($unset). */
 export async function updateProduct(id: number, data: Record<string, unknown>) {
   await connectDb();
-  await ProductModel.updateOne({ id }, { $set: data });
+  const set: Record<string, unknown> = {};
+  const unset: Record<string, ""> = {};
+  for (const [key, value] of Object.entries(data)) {
+    if (value === undefined) continue;
+    if (value === null) unset[key] = "";
+    else set[key] = value;
+  }
+  const update: Record<string, unknown> = {};
+  if (Object.keys(set).length) update.$set = set;
+  if (Object.keys(unset).length) update.$unset = unset;
+  if (Object.keys(update).length) await ProductModel.updateOne({ id }, update);
+
+  // Re-price from the stored document so partial updates price correctly.
+  const product = await ProductModel.findOne({ id }).lean<Record<string, any>>();
+  if (product) {
+    const { goldValue, total } = priceProduct(product, await getCurrentGoldRates());
+    if (total !== null) {
+      await ProductModel.updateOne({ id }, { $set: { basePrice: goldValue, totalPrice: total } });
+    } else if (data.totalPrice === undefined) {
+      // Nothing left to price from (and no manual price given): drop the stale price.
+      await ProductModel.updateOne({ id }, { $unset: { basePrice: "", totalPrice: "" } });
+    }
+  }
   return await getProductById(id);
 }
 
 export async function deleteProduct(id: number) {
   await connectDb();
   await ProductModel.deleteOne({ id });
+  await CatalogProductModel.deleteMany({ productId: id });
+  const collectionLinks = await CollectionProductModel.find({ productId: id }).lean<Array<{ collectionId: number }>>();
+  await CollectionProductModel.deleteMany({ productId: id });
+  for (const collectionId of Array.from(new Set(collectionLinks.map(link => link.collectionId)))) {
+    await CollectionModel.updateOne(
+      { id: collectionId },
+      { $set: { productCount: await CollectionProductModel.countDocuments({ collectionId }) } }
+    );
+  }
+}
+
+// ============ BULK PRODUCT IMPORT ============
+
+export async function listProductSourceKeys(): Promise<string[]> {
+  await connectDb();
+  const rows = await ProductModel.find({ sourceKey: { $exists: true, $ne: null } }, { sourceKey: 1 }).lean<Array<{ sourceKey: string }>>();
+  return rows.map(row => row.sourceKey);
+}
+
+export async function getProductBySourceKey(sourceKey: string) {
+  await connectDb();
+  return ProductModel.findOne({ sourceKey }).lean<Record<string, any>>();
+}
+
+export async function findOrCreateCategory(name: string) {
+  await connectDb();
+  const pattern = new RegExp(`^${escapeRegex(name.trim())}$`, "i");
+  const existing = await CategoryModel.findOne({ name: pattern }).lean<Record<string, any>>();
+  if (existing) return existing;
+  try {
+    const id = await nextSafeId(CategoryModel, "categories");
+    const created = await CategoryModel.create({ id, name: name.trim() });
+    return created.toObject() as Record<string, any>;
+  } catch (error) {
+    // Another upload created it at the same moment (unique name).
+    if ((error as { code?: number })?.code !== 11000) throw error;
+    const again = await CategoryModel.findOne({ name: pattern }).lean<Record<string, any>>();
+    if (!again) throw error;
+    return again;
+  }
+}
+
+// Serialises creation per folder name inside this server process (collections have
+// no unique index on name, so parallel uploads of a new folder must not race).
+const collectionCreation = new Map<string, Promise<Record<string, any>>>();
+
+export async function findOrCreateCollection(name: string, userId?: number) {
+  const key = name.trim().toLowerCase();
+  const inFlight = collectionCreation.get(key);
+  if (inFlight) return inFlight;
+  const promise = findOrCreateCollectionUnsafe(name, userId).finally(() => collectionCreation.delete(key));
+  collectionCreation.set(key, promise);
+  return promise;
+}
+
+async function findOrCreateCollectionUnsafe(name: string, userId?: number) {
+  await connectDb();
+  const pattern = new RegExp(`^${escapeRegex(name.trim())}$`, "i");
+  const existing = await CollectionModel.findOne({ name: pattern }).lean<Record<string, any>>();
+  if (existing) return existing;
+  const id = await nextSafeId(CollectionModel, "collections");
+  const created = await CollectionModel.create({ id, name: name.trim(), createdBy: userId, isActive: true, productCount: 0 });
+  return created.toObject() as Record<string, any>;
+}
+
+/** Atomic running number per category (used for generated product names/SKUs). */
+export async function nextProductNumberInCategory(categoryId: number): Promise<number> {
+  await connectDb();
+  const name = `category_products_${categoryId}`;
+  const existing = await ProductModel.countDocuments({ categoryId });
+  await Counter.updateOne({ name }, { $max: { value: existing } }, { upsert: true }).catch(error => {
+    if ((error as { code?: number })?.code !== 11000) throw error;
+  });
+  return getNextSequence(name);
 }
 
 // Customers
@@ -1476,7 +1677,26 @@ export async function getOrderWithDetails(orderId: number) {
 
 // ============ FILE STORAGE ============
 
+// Images go to the Railway volume when UPLOAD_DIR is set, otherwise into MongoDB.
+// Both are served by GET /api/files/:id.
+const SAFE_FILE_ID = /^[A-Za-z0-9_-]{6,64}\.(jpe?g|png|webp|gif)$/;
+
+export function isSafeFileId(id: string) {
+  return SAFE_FILE_ID.test(id);
+}
+
+export function diskFilePath(id: string): string | null {
+  if (!ENV.uploadDir || !isSafeFileId(id)) return null;
+  return path.resolve(ENV.uploadDir, id);
+}
+
 export async function saveFile(data: { id: string; filename?: string; contentType: string; buffer: Buffer; createdBy?: number }) {
+  const diskPath = diskFilePath(data.id);
+  if (diskPath) {
+    await fs.promises.mkdir(path.dirname(diskPath), { recursive: true });
+    await fs.promises.writeFile(diskPath, data.buffer);
+    return { id: data.id, url: `/api/files/${data.id}` };
+  }
   await connectDb();
   await StoredFileModel.create({
     id: data.id,
@@ -1487,6 +1707,23 @@ export async function saveFile(data: { id: string; filename?: string; contentTyp
     createdBy: data.createdBy,
   });
   return { id: data.id, url: `/api/files/${data.id}` };
+}
+
+/** Best-effort removal of uploaded files by their /api/files/:id URL. */
+export async function deleteStoredFiles(urls: string[]) {
+  for (const url of urls) {
+    const id = url.split("/").pop() ?? "";
+    const diskPath = diskFilePath(id);
+    try {
+      if (diskPath) await fs.promises.unlink(diskPath);
+      else if (id) {
+        await connectDb();
+        await StoredFileModel.deleteOne({ id });
+      }
+    } catch {
+      // already gone
+    }
+  }
 }
 
 export async function getFile(id: string) {

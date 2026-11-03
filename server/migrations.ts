@@ -110,6 +110,14 @@ const MIGRATIONS: Migration[] = [
       };
     },
   },
+  {
+    // Bulk product import (unique sourceKey) + white gold rate.
+    name: "2026-11-03-product-import-white-gold",
+    run: async () => {
+      await ProductModel.createIndexes();
+      return { productIndexes: "ok" };
+    },
+  },
 ];
 
 export async function runMigrations(log: (message: string) => void = console.log) {

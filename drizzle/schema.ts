@@ -31,6 +31,10 @@ export const goldPrices = mysqlTable("gold_prices", {
   priceDate: date("priceDate").notNull(),
   price22k: decimal("price22k", { precision: 12, scale: 2 }).notNull(), // PKR per tola
   price24k: decimal("price24k", { precision: 12, scale: 2 }).notNull(), // PKR per tola
+  whiteGoldPrice: decimal("whiteGoldPrice", { precision: 12, scale: 2 }), // PKR per tola
+  whiteGoldKarat: varchar("whiteGoldKarat", { length: 10 }), // e.g. "18k"
+  marketReference24k: decimal("marketReference24k", { precision: 12, scale: 2 }), // live international 24k/tola when saved
+  source: varchar("source", { length: 20 }), // "live" | "manual"
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   createdBy: int("createdBy").references(() => users.id),
@@ -59,7 +63,7 @@ export const products = mysqlTable("products", {
   categoryId: int("categoryId").references(() => categories.id),
   
   // Gold details
-  goldKarat: mysqlEnum("goldKarat", ["22k", "24k"]),
+  goldKarat: mysqlEnum("goldKarat", ["22k", "24k", "white"]), // "white" = white gold (karat set on the daily gold price)
   goldWeight: decimal("goldWeight", { precision: 10, scale: 3 }), // in tola (including wastage)
   goldWastage: decimal("goldWastage", { precision: 5, scale: 2 }), // wastage percentage
   goldRateAtOrder: decimal("goldRateAtOrder", { precision: 12, scale: 2 }), // gold rate when product was created/ordered
@@ -82,6 +86,8 @@ export const products = mysqlTable("products", {
   // Images (JSON array of URLs)
   images: text("images"), // JSON array
   primaryImage: text("primaryImage"),
+  thumbnail: text("thumbnail"), // small preview image for grids
+  sourceKey: varchar("sourceKey", { length: 255 }), // bulk import key ("Folder/file.jpeg"), prevents duplicates
   
   // Pricing
   basePrice: decimal("basePrice", { precision: 12, scale: 2 }), // calculated gold price

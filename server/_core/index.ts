@@ -6,8 +6,10 @@ import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
-import { connectDb, ensureAdminUser, getFile } from "../db";
+import fs from "fs";
+import { connectDb, diskFilePath, ensureAdminUser, getFile } from "../db";
 import { runMigrations } from "../migrations";
+import { ENV } from "./env";
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -32,6 +34,12 @@ async function startServer() {
   await connectDb();
   await ensureAdminUser();
   await runMigrations();
+  if (ENV.uploadDir) {
+    fs.mkdirSync(ENV.uploadDir, { recursive: true });
+    console.log(`[files] storing uploaded images on disk in ${ENV.uploadDir}`);
+  } else {
+    console.warn("[files] UPLOAD_DIR is not set: images are stored in MongoDB. Set it to a Railway volume path for product images.");
+  }
 
   const app = express();
   const server = createServer(app);
@@ -41,7 +49,15 @@ async function startServer() {
   // Uploaded images stored in MongoDB (see storage.ts → storeImage)
   app.get("/api/files/:id", async (req, res) => {
     try {
-      const file = await getFile(String(req.params.id));
+      const id = String(req.params.id);
+      const diskPath = diskFilePath(id);
+      if (diskPath && fs.existsSync(diskPath)) {
+        res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+        res.setHeader("X-Content-Type-Options", "nosniff");
+        res.sendFile(diskPath);
+        return;
+      }
+      const file = await getFile(id);
       if (!file) {
         res.status(404).send("Not found");
         return;

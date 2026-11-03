@@ -11,4 +11,7 @@ export const ENV = {
   llmApiUrl: process.env.LLM_API_URL ?? "",
   llmApiKey: process.env.LLM_API_KEY ?? process.env.OPENAI_API_KEY ?? "",
   llmModel: process.env.LLM_MODEL ?? "",
+  // Folder on the Railway volume where uploaded/imported images are stored (e.g. /data/uploads).
+  // When empty, images are stored in MongoDB instead.
+  uploadDir: process.env.UPLOAD_DIR ?? "",
 };

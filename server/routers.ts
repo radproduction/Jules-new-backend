@@ -12,6 +12,9 @@ import { invokeLLM } from "./_core/llm";
 import { storeImage } from "./storage";
 import { TRPCError } from "@trpc/server";
 import { signSession, verifyPassword } from "./_core/auth";
+import { fetchLiveGoldRate } from "./goldRate";
+import { WHITE_GOLD_KARATS } from "../shared/pricing";
+import { ENV } from "./_core/env";
 
 /** Run a data-layer call and surface domain errors (validation/integrity) as 400s. */
 async function guard<T>(fn: () => Promise<T>): Promise<T> {
@@ -22,6 +25,80 @@ async function guard<T>(fn: () => Promise<T>): Promise<T> {
     const message = (error as Error)?.message || "Request failed";
     throw new TRPCError({ code: "BAD_REQUEST", message, cause: error });
   }
+}
+
+/**
+ * Decimal input from forms: accepts "12.5" or 12.5.
+ * undefined = leave unchanged, "" / null = clear the value.
+ */
+const decimalInput = z
+  .union([z.string(), z.number()])
+  .nullish()
+  .transform((value, ctx) => {
+    if (value === undefined) return undefined;
+    if (value === null || (typeof value === "string" && value.trim() === "")) return null;
+    const parsed = typeof value === "number" ? value : Number(value.replace(/,/g, ""));
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      ctx.addIssue({ code: "custom", message: "Enter a valid positive number" });
+      return z.NEVER;
+    }
+    return parsed;
+  });
+
+const productKarat = z.enum(["22k", "24k", "white"]);
+
+const productFields = {
+  description: z.string().optional(),
+  sku: z.string().optional(),
+  goldWeight: decimalInput,
+  goldWastage: decimalInput,
+  goldRateAtOrder: decimalInput,
+  makingCharges: decimalInput,
+  makingChargesType: z.enum(["fixed", "per_gram"]).optional(),
+  diamondWeight: decimalInput,
+  diamondRate: decimalInput,
+  diamondPrice: decimalInput,
+  stoneType: z.string().optional(),
+  stoneWeight: decimalInput,
+  stoneRate: decimalInput,
+  stonePrice: decimalInput,
+  images: z.string().optional(),
+  primaryImage: z.string().optional(),
+  thumbnail: z.string().optional(),
+  /** Only used when the product has no gold/making/stone inputs to price from. */
+  totalPrice: decimalInput,
+};
+
+/** Strip undefined so create() does not store empty keys. */
+function compact<T extends Record<string, unknown>>(data: T): Partial<T> {
+  return Object.fromEntries(Object.entries(data).filter(([, value]) => value !== undefined)) as Partial<T>;
+}
+
+const base64Image = z.string().max(8_000_000, "Image is too large");
+
+function decodeImage(value: string): Buffer {
+  const buffer = Buffer.from(value.replace(/^data:[^;]+;base64,/, ""), "base64");
+  if (!buffer.length) throw new TRPCError({ code: "BAD_REQUEST", message: "Empty image" });
+  if (buffer.length > 6 * 1024 * 1024) {
+    throw new TRPCError({ code: "BAD_REQUEST", message: "Image is larger than 6 MB" });
+  }
+  return buffer;
+}
+
+/** "Diamond Rings" -> "DR", "Gold Karas" -> "GK". */
+function skuPrefix(name: string) {
+  const letters = name
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(word => word[0]!.toUpperCase())
+    .join("");
+  return (letters || "PR").slice(0, 3);
+}
+
+/** "Diamond Rings" -> "Diamond Ring", "Gold Karas" -> "Gold Kara". */
+function singular(name: string) {
+  const trimmed = name.trim();
+  return /[^s]s$/i.test(trimmed) ? trimmed.slice(0, -1) : trimmed;
 }
 
 const optionalDate = z.string().optional().refine(
@@ -93,16 +170,40 @@ export const appRouter = router({
     getLatest: operationsFinanceProcedure.query(async () => {
       return await db.getLatestGoldPrice();
     }),
+    /** Suggested rate for today from the live international market (+ learned local premium). */
+    live: operationsFinanceProcedure.query(async () => {
+      try {
+        const reference = await db.getLatestRateWithMarketReference();
+        return { ok: true as const, rate: await fetchLiveGoldRate(reference) };
+      } catch (error) {
+        console.error("[gold] live rate unavailable", error);
+        return { ok: false as const, message: "Live gold rate is unavailable right now. Please enter today's rate manually." };
+      }
+    }),
     set: operationsFinanceProcedure
       .input(z.object({
-        price22k: z.coerce.string(),
-        price24k: z.coerce.string(),
+        price22k: z.coerce.number().positive("Enter the 22K rate"),
+        price24k: z.coerce.number().positive("Enter the 24K rate"),
+        whiteGoldPrice: z.coerce.number().positive().nullish(),
+        whiteGoldKarat: z.enum(WHITE_GOLD_KARATS).nullish(),
+        marketReference24k: z.coerce.number().positive().nullish(),
+        source: z.enum(["live", "manual"]).optional(),
       }))
       .mutation(async ({ input, ctx }) => {
-        return await db.setGoldPrice({
+        if (input.price22k > input.price24k) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "22K rate cannot be higher than the 24K rate" });
+        }
+        if (input.whiteGoldPrice && !input.whiteGoldKarat) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "Select the white gold karat" });
+        }
+        const saved = await db.setGoldPrice({
           ...input,
+          whiteGoldPrice: input.whiteGoldPrice ?? null,
+          whiteGoldKarat: input.whiteGoldPrice ? input.whiteGoldKarat ?? null : null,
           userId: ctx.user.id,
         });
+        const repriced = await db.recalculateAllProductPrices();
+        return { ...saved, productsUpdated: repriced.updated };
       }),
   }),
 
@@ -133,64 +234,87 @@ export const appRouter = router({
     
     create: adminProcedure
       .input(z.object({
-        name: z.string().min(1),
-        description: z.string().optional(),
-        sku: z.string().optional(),
+        name: z.string().trim().min(1, "Product name is required"),
         categoryId: z.number().optional(),
-        goldKarat: z.enum(["22k", "24k"]).optional(),
-        goldWeight: z.string().optional(),
-        goldWastage: z.string().optional(),
-        goldRateAtOrder: z.string().optional(),
-        makingCharges: z.string().optional(),
-        makingChargesType: z.enum(["fixed", "per_gram"]).optional(),
-        diamondWeight: z.string().optional(),
-        diamondRate: z.string().optional(),
-        diamondPrice: z.string().optional(),
-        stoneType: z.string().optional(),
-        stoneWeight: z.string().optional(),
-        stoneRate: z.string().optional(),
-        stonePrice: z.string().optional(),
-        images: z.string().optional(),
-        primaryImage: z.string().optional(),
-        basePrice: z.string().optional(),
-        totalPrice: z.string().optional(),
+        goldKarat: productKarat.optional(),
+        ...productFields,
       }))
       .mutation(async ({ input, ctx }) => {
-        return await db.createProduct({
+        return await db.createProduct(compact({
           ...input,
           createdBy: ctx.user.id,
-        });
+        }));
       }),
     
     update: adminProcedure
       .input(z.object({
         id: z.number(),
-        name: z.string().min(1).optional(),
-        description: z.string().optional(),
-        sku: z.string().optional(),
+        name: z.string().trim().min(1).optional(),
         categoryId: z.number().nullable().optional(),
-        goldKarat: z.enum(["22k", "24k"]).nullable().optional(),
-        goldWeight: z.string().optional(),
-        goldWastage: z.string().optional(),
-        goldRateAtOrder: z.string().optional(),
-        makingCharges: z.string().optional(),
-        makingChargesType: z.enum(["fixed", "per_gram"]).optional(),
-        diamondWeight: z.string().optional(),
-        diamondRate: z.string().optional(),
-        diamondPrice: z.string().optional(),
-        stoneType: z.string().optional(),
-        stoneWeight: z.string().optional(),
-        stoneRate: z.string().optional(),
-        stonePrice: z.string().optional(),
-        images: z.string().optional(),
-        primaryImage: z.string().optional(),
-        basePrice: z.string().optional(),
-        totalPrice: z.string().optional(),
+        goldKarat: productKarat.nullable().optional(),
         isActive: z.boolean().optional(),
+        ...productFields,
       }))
       .mutation(async ({ input }) => {
         const { id, ...data } = input;
         return await db.updateProduct(id, data);
+      }),
+
+    /** sourceKeys of products already imported (lets the importer skip them). */
+    importedKeys: adminProcedure.query(async () => {
+      return await db.listProductSourceKeys();
+    }),
+
+    /**
+     * Bulk import: one image = one product. The folder name becomes the
+     * category and the collection; name/SKU are generated. Idempotent per sourceKey.
+     */
+    importImage: adminProcedure
+      .input(z.object({
+        folder: z.string().trim().min(1).max(100),
+        sourceKey: z.string().trim().min(1).max(255),
+        image: base64Image,
+        thumbnail: base64Image,
+      }))
+      .mutation(async ({ input, ctx }) => {
+        if (!ENV.uploadDir) {
+          throw new TRPCError({
+            code: "PRECONDITION_FAILED",
+            message: "Image storage is not configured on the server (set UPLOAD_DIR to the Railway volume path).",
+          });
+        }
+        const existing = await db.getProductBySourceKey(input.sourceKey);
+        if (existing) return { status: "skipped" as const, productId: existing.id as number };
+
+        const category = await db.findOrCreateCategory(input.folder);
+        const collection = await db.findOrCreateCollection(input.folder, ctx.user.id);
+        const image = await storeImage("products", decodeImage(input.image), "image/jpeg", "product.jpg", ctx.user.id);
+        const thumb = await storeImage("products", decodeImage(input.thumbnail), "image/jpeg", "thumb.jpg", ctx.user.id);
+
+        const sequence = await db.nextProductNumberInCategory(category.id);
+        const number = String(sequence).padStart(4, "0");
+        try {
+          const product = await db.createProduct({
+            name: `${singular(category.name)} ${number}`,
+            sku: `${skuPrefix(category.name)}-${number}`,
+            categoryId: category.id,
+            primaryImage: image.url,
+            thumbnail: thumb.url,
+            sourceKey: input.sourceKey,
+            isActive: true,
+            createdBy: ctx.user.id,
+          });
+          await db.addProductsToCollection(collection.id, [product.id]);
+          return { status: "created" as const, productId: product.id };
+        } catch (error) {
+          // Two uploads of the same file at once: the unique sourceKey index wins.
+          if ((error as { code?: number })?.code === 11000) {
+            await db.deleteStoredFiles([image.url, thumb.url]);
+            const again = await db.getProductBySourceKey(input.sourceKey);
+            if (again) return { status: "skipped" as const, productId: again.id as number };
+          }
+          throw error;
+        }
       }),
     
     delete: adminProcedure
@@ -1024,7 +1148,17 @@ Keep the response concise, professional, and encouraging. Format it nicely with 
         const catalogs = await db.getAllCatalogs();
         const collections = await db.getAllCollections();
         
-        const productList = products.map(p => `- ID:${p.product.id} "${p.product.name}" (Category: ${p.category?.name || 'N/A'}, Karat: ${p.product.goldKarat || 'N/A'}, SKU: ${p.product.sku || 'N/A'}, Price: PKR ${p.product.basePrice || 'N/A'})`).join('\n');
+        // Thousands of imported products would overflow the model context:
+        // send per-category counts plus the most recent products only.
+        const MAX_PRODUCTS_IN_PROMPT = 150;
+        const categoryCounts = new Map<string, number>();
+        for (const p of products) {
+          const key = p.category?.name || "Uncategorised";
+          categoryCounts.set(key, (categoryCounts.get(key) ?? 0) + 1);
+        }
+        const categorySummary = Array.from(categoryCounts.entries()).map(([name, count]) => `${name}: ${count}`).join(", ");
+        const productList = (products.length > MAX_PRODUCTS_IN_PROMPT ? `(${products.length} products in total — ${categorySummary}. Showing the ${MAX_PRODUCTS_IN_PROMPT} most recent.)\n` : "") +
+          products.slice(0, MAX_PRODUCTS_IN_PROMPT).map(p => `- ID:${p.product.id} "${p.product.name}" (Category: ${p.category?.name || 'N/A'}, Karat: ${p.product.goldKarat || 'N/A'}, SKU: ${p.product.sku || 'N/A'}, Price: PKR ${p.product.totalPrice || 'N/A'})`).join('\n');
         const customerList = customers.map(c => `- ID:${c.id} "${c.firstName} ${c.lastName || ''}" (Email: ${c.email || 'N/A'}, Phone: ${c.phone || 'N/A'}, City: ${c.city || 'N/A'})`).join('\n');
         const catalogList = catalogs.map(c => `- ${c.catalog.name} (ID: ${c.catalog.id}, Status: ${c.catalog.status}, Token: ${c.catalog.publicToken})`).join('\n');
         const collectionList = collections.map(c => `- ${c.name} (ID: ${c.id}, ${c.productCount || 0} products)`).join('\n');

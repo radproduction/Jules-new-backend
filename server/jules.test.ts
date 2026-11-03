@@ -90,8 +90,9 @@ describe("Gold Price Router", () => {
     expect(db.getTodayGoldPrice).toHaveBeenCalled();
   });
 
-  it("should set gold price", async () => {
-    vi.mocked(db.setGoldPrice).mockResolvedValue({ success: true } as any);
+  it("should set gold price and re-price every product", async () => {
+    vi.mocked(db.setGoldPrice).mockResolvedValue({ id: 1, price22k: "245000.00" } as any);
+    vi.mocked(db.recalculateAllProductPrices).mockResolvedValue({ updated: 3, total: 5 });
     
     const { ctx } = createAuthContext();
     const caller = appRouter.createCaller(ctx);
@@ -99,10 +100,22 @@ describe("Gold Price Router", () => {
     const result = await caller.goldPrice.set({
       price22k: "245000",
       price24k: "267000",
+      whiteGoldPrice: "200000",
+      whiteGoldKarat: "18k",
     });
     
-    expect(result.success).toBe(true);
-    expect(db.setGoldPrice).toHaveBeenCalled();
+    expect(result.productsUpdated).toBe(3);
+    expect(db.setGoldPrice).toHaveBeenCalledWith(
+      expect.objectContaining({ price22k: 245000, price24k: 267000, whiteGoldPrice: 200000, whiteGoldKarat: "18k", userId: 1 })
+    );
+    expect(db.recalculateAllProductPrices).toHaveBeenCalled();
+  });
+
+  it("should reject a 22K rate above the 24K rate", async () => {
+    const { ctx } = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+    await expect(caller.goldPrice.set({ price22k: "300000", price24k: "267000" })).rejects.toThrow();
+    expect(db.setGoldPrice).not.toHaveBeenCalled();
   });
 });
 
@@ -132,6 +145,27 @@ describe("Categories Router", () => {
 describe("Products Router", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("should accept numbers from the edit form (Mongo returns numbers)", async () => {
+    vi.mocked(db.updateProduct).mockResolvedValue({ product: { id: 7 } } as any);
+    const { ctx } = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+
+    await caller.products.update({ id: 7, goldWeight: 1.25, makingCharges: "15000", diamondPrice: "", goldKarat: "white" });
+
+    expect(db.updateProduct).toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({ goldWeight: 1.25, makingCharges: 15000, diamondPrice: null, goldKarat: "white" })
+    );
+  });
+
+  it("should refuse bulk import when no image storage folder is configured", async () => {
+    const { ctx } = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+    await expect(
+      caller.products.importImage({ folder: "Diamond Rings", sourceKey: "Diamond Rings/a.jpeg", image: "aGk=", thumbnail: "aGk=" })
+    ).rejects.toThrow(/UPLOAD_DIR/);
   });
 
   it("should list products", async () => {
