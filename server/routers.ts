@@ -296,6 +296,11 @@ export const appRouter = router({
       .query(async ({ input }) => {
         return await db.getProductById(input.id);
       }),
+
+    // Light list for picking a catalogue piece on an order item (staff can use it too).
+    pick: operationsFinanceProcedure
+      .input(z.object({ search: z.string().max(100).optional(), limit: z.number().int().min(1).max(100).optional() }).optional())
+      .query(async ({ input }) => db.searchProductsLite(input?.search, input?.limit ?? 40)),
     
     create: adminProcedure
       .input(z.object({

@@ -185,6 +185,26 @@ async function cancelOrder(orderId: number, user: User) {
 }
 
 export const ordersRouter = router({
+  // Pictures don't change any amount, so they can be set even after the order is invoiced.
+  setItemPicture: operationsFinanceProcedure
+    .input(z.object({
+      itemId: z.number().int().positive(),
+      images: z.array(imageUrl).max(10),
+      productId: z.number().int().positive().nullable().optional(),
+    }))
+    .mutation(async ({ input }) => {
+      const item = await db.getOrderItemById(input.itemId);
+      if (!item) throw new TRPCError({ code: "NOT_FOUND", message: "Order item not found" });
+      const existing = await db.getOrderById(item.orderId);
+      if (!existing) throw new TRPCError({ code: "NOT_FOUND", message: "Order not found" });
+      if (existing.order.status === "cancelled") throw bad("This order is cancelled and can no longer be edited.");
+      if (input.productId && !(await db.getProductById(input.productId))) throw bad("Product not found");
+      return db.updateOrderItem(input.itemId, {
+        images: input.images,
+        ...(input.productId !== undefined ? { productId: input.productId ?? 0 } : {}),
+      });
+    }),
+
   list: operationsFinanceProcedure
     .input(z.object({
       status: z.string().optional(),

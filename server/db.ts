@@ -742,6 +742,34 @@ export async function getAllCategories() {
 }
 
 // Products
+/** Small product list for pickers (order items): newest first, with one picture each. */
+export async function searchProductsLite(search?: string, limit = 40) {
+  await connectDb();
+  const query: Record<string, unknown> = {};
+  if (search?.trim()) {
+    const pattern = escapeRegex(search.trim());
+    query.$or = [{ name: { $regex: pattern, $options: "i" } }, { sku: { $regex: pattern, $options: "i" } }];
+  }
+  const products = await ProductModel.find(query, { id: 1, name: 1, sku: 1, thumbnail: 1, primaryImage: 1, images: 1, categoryId: 1 })
+    .sort({ createdAt: -1, id: -1 })
+    .limit(Math.min(Math.max(limit, 1), 100))
+    .lean();
+  const categoryIds = Array.from(new Set(products.map(p => p.categoryId).filter(Boolean)));
+  const categories = categoryIds.length ? await CategoryModel.find({ id: { $in: categoryIds } }, { id: 1, name: 1 }).lean() : [];
+  const names = new Map(categories.map(cat => [cat.id, cat.name as string]));
+  return products.map((product: any) => {
+    const image = product.primaryImage || String(product.images ?? "").split(",").map((url: string) => url.trim()).find(Boolean) || product.thumbnail || null;
+    return {
+      id: product.id as number,
+      name: product.name as string,
+      sku: (product.sku as string | undefined) ?? null,
+      category: product.categoryId ? names.get(product.categoryId) ?? null : null,
+      thumbnail: (product.thumbnail as string | undefined) || image,
+      image,
+    };
+  });
+}
+
 export async function getAllProducts(filters?: { categoryId?: number; search?: string; isActive?: boolean }) {
   await connectDb();
   const query: Record<string, unknown> = {};
@@ -1805,6 +1833,12 @@ export async function getFile(id: string) {
 }
 
 // ============ ORDER EDITING HELPERS ============
+
+export async function getOrderItemById(id: number) {
+  await connectDb();
+  const item = await OrderItemModel.findOne({ id }).lean();
+  return item ? orderItemRow(item) : null;
+}
 
 export async function updateOrderItem(id: number, data: Record<string, unknown>) {
   await connectDb();
