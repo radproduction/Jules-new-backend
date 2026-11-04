@@ -418,6 +418,7 @@ const OrderInvoiceItemSchema = new Schema(
     rate: { type: Number },
     calculateBy: { type: String, default: "weight" },
     amount: { type: Number },
+    lineType: { type: String, enum: ["metal", "stone"] },
     sortOrder: { type: Number, default: 0 },
   },
   { ...withTimestamps, collection: "order_invoice_items" }
@@ -1657,24 +1658,44 @@ export async function generateInvoiceNumber() {
 
 // ============ ENHANCED ORDER FUNCTIONS ============
 
+/** One picture per order item for the invoice header: its own photo, else its catalogue product's. */
+export async function getOrderItemCovers(orderId: number): Promise<Record<number, string>> {
+  await connectDb();
+  const items = await OrderItemModel.find({ orderId }).sort({ id: 1 }).lean();
+  const productMap = await productNameMap(items.map(item => item.productId));
+  const covers: Record<number, string> = {};
+  for (const item of items as any[]) {
+    const own = Array.isArray(item.images) ? item.images.find((url: unknown) => typeof url === "string" && url) : undefined;
+    const product = item.productId ? productMap.get(item.productId) : null;
+    const fromProduct = product
+      ? product.primaryImage || String(product.images ?? "").split(",").map((url: string) => url.trim()).find(Boolean) || product.thumbnail
+      : undefined;
+    const cover = own || fromProduct;
+    if (cover) covers[item.id] = cover;
+  }
+  return covers;
+}
+
 export async function getOrderWithDetails(orderId: number) {
   await connectDb();
   const order = await OrderModel.findOne({ id: orderId }).lean();
   if (!order) return null;
   const customer = order.customerId ? await CustomerModel.findOne({ id: order.customerId }).lean() : null;
 
-  const [items, processes, advanceMetals, advanceGems, invoices] = await Promise.all([
+  const [items, processes, advanceMetals, advanceGems, invoices, itemCovers] = await Promise.all([
     getOrderItemsRaw(orderId),
     getOrderProcesses(orderId),
     getOrderAdvanceMetals(orderId),
     getOrderAdvanceGems(orderId),
     getOrderInvoices(orderId),
+    getOrderItemCovers(orderId),
   ]);
 
   return {
     order: orderRow(order),
     customer: toRowOrNull(customersTable, customer),
     items,
+    itemCovers,
     processes,
     advanceMetals,
     advanceGems,

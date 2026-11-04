@@ -18,6 +18,18 @@ const journalLineSchema = z.object({
   credit: z.string().optional(),
 });
 
+const voucherSchema = z.object({
+  voucherType: z.enum(["cash_receipt", "cash_payment"]),
+  entryDate: dateString,
+  cashAccountId: z.number().int().positive(),
+  narration: z.string().optional(),
+  counterpartLines: z.array(z.object({
+    accountId: z.number().int().positive(),
+    amount: z.string(),
+    description: z.string().optional(),
+  })).min(1),
+});
+
 export const accessRouter = router({
   users: adminProcedure.query(async () => finance.listUsers()),
 
@@ -147,22 +159,23 @@ export const financeRouter = router({
 
   vouchers: router({
     create: operationsFinanceProcedure
-      .input(z.object({
-        voucherType: z.enum(["cash_receipt", "cash_payment"]),
-        entryDate: dateString,
-        cashAccountId: z.number().int().positive(),
-        narration: z.string().optional(),
-        counterpartLines: z.array(z.object({
-          accountId: z.number().int().positive(),
-          amount: z.string(),
-          description: z.string().optional(),
-        })).min(1),
-      }))
+      .input(voucherSchema)
       .mutation(async ({ input, ctx }) => finance.createCashVoucher({
         ...input,
         entryDate: new Date(input.entryDate),
         createdBy: ctx.user.id,
       })),
+    // Edit = post the corrected voucher and reverse the old one (audit trail kept).
+    update: operationsFinanceProcedure
+      .input(voucherSchema.extend({ id: z.number().int().positive() }))
+      .mutation(async ({ input, ctx }) => {
+        const { id, ...data } = input;
+        try {
+          return await finance.updateCashVoucher(id, { ...data, entryDate: new Date(data.entryDate) }, ctx.user.id);
+        } catch (error) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: (error as Error).message });
+        }
+      }),
     // "Delete" a cash receive/payment voucher: it is reversed, never erased.
     delete: operationsFinanceProcedure
       .input(z.object({ id: z.number().int().positive(), reason: z.string().trim().min(3).max(300) }))

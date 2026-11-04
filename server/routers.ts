@@ -14,6 +14,7 @@ import { TRPCError } from "@trpc/server";
 import { signSession, verifyPassword } from "./_core/auth";
 import { fetchLiveGoldRate } from "./goldRate";
 import { WHITE_GOLD_KARATS } from "../shared/pricing";
+import { invoiceLinesFromOrderItems } from "../shared/invoiceLines";
 import { ENV } from "./_core/env";
 import { describeJewelry, visionConfigured, type JewelryDescription } from "./_core/vision";
 
@@ -1053,6 +1054,7 @@ export const appRouter = router({
           rate: z.string().optional(),
           calculateBy: z.string().optional(),
           amount: z.string().optional(),
+          lineType: z.enum(["metal", "stone"]).optional(),
           sortOrder: z.number().optional(),
         })).optional(),
       }))
@@ -1102,8 +1104,10 @@ export const appRouter = router({
           status: totalCents > 0 ? "sent" : "draft",
           createdBy: ctx.user.id,
         });
-        if (items && items.length > 0) {
-          await db.addInvoiceItems(invoice.id, items);
+        // No lines sent: copy them from the order items (metal + stone line per item), like the shop's bill.
+        const lines = items && items.length > 0 ? items : invoiceLinesFromOrderItems(orderItems);
+        if (lines.length > 0) {
+          await db.addInvoiceItems(invoice.id, lines);
         }
         if (totalCents > 0) {
           await financeDb.postInvoiceToLedger(invoice.id, ctx.user.id);
@@ -1133,6 +1137,7 @@ export const appRouter = router({
           rate: z.string().optional(),
           calculateBy: z.string().optional(),
           amount: z.string().optional(),
+          lineType: z.enum(["metal", "stone"]).optional(),
           sortOrder: z.number().optional(),
         })).optional(),
       }))

@@ -409,6 +409,7 @@ export const orderInvoiceItems = mysqlTable("order_invoice_items", {
   rate: decimal("rate", { precision: 12, scale: 2 }),
   calculateBy: varchar("calculateBy", { length: 20 }).default("weight"), // weight or percentage
   amount: decimal("amount", { precision: 14, scale: 2 }),
+  lineType: varchar("lineType", { length: 10 }), // metal | stone
   sortOrder: int("sortOrder").default(0),
   
   createdAt: timestamp("createdAt").defaultNow().notNull(),

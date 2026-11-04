@@ -1103,6 +1103,41 @@ export async function deleteCashVoucher(id: number, reason: string, userId: numb
   return reversal;
 }
 
+/**
+ * Edit a cash receipt/payment. Posted entries are never changed in place: the corrected
+ * voucher is posted first, then the old one is reversed (so a failed edit changes nothing).
+ */
+export async function updateCashVoucher(
+  id: number,
+  data: Omit<Parameters<typeof createCashVoucher>[0], "createdBy">,
+  userId: number
+) {
+  await connectDb();
+  const entry = await JournalEntryModel.findOne({ id }).lean<JournalEntryDoc>();
+  if (!entry) throw new Error("Voucher not found");
+  if (entry.entryType !== "cash_receipt" && entry.entryType !== "cash_payment") {
+    throw new Error("Only cash receive / payment vouchers can be edited here");
+  }
+  if (entry.status === "reversed") throw new Error("This voucher was deleted or already edited. Edit its latest version.");
+
+  const corrected = await createCashVoucher({ ...data, createdBy: userId });
+  try {
+    await reverseJournalEntry(id, `Voucher edited: replaced by ${corrected.entryNumber}`, userId);
+  } catch (error) {
+    // Undo the new voucher so the books are exactly as before.
+    await reverseJournalEntry(corrected.id, `Edit of ${entry.entryNumber} failed`, userId).catch(() => undefined);
+    throw error;
+  }
+  await createAuditLog({
+    action: "voucher.updated",
+    entityType: "journal_entry",
+    entityId: id,
+    details: { from: entry.entryNumber, to: corrected.entryNumber },
+    createdBy: userId,
+  });
+  return corrected;
+}
+
 /** True when a source document (invoice, advance) has a live (non-reversed) posting. */
 export async function hasActivePosting(referenceType: string, referenceId: number) {
   await connectDb();
