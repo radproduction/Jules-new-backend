@@ -43,6 +43,7 @@ export const accessRouter = router({
     .mutation(async ({ input, ctx }) => {
       try {
         const user = await db.createUserAccount(input);
+        await finance.ensureStaffLedger(user.id, ctx.user.id).catch(() => undefined);
         await finance.createAuditLog({
           action: "user.created",
           entityType: "user",

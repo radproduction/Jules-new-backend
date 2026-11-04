@@ -307,11 +307,24 @@ const VendorSchema = new Schema(
     id: { type: Number, required: true, unique: true, index: true },
     code: { type: String, unique: true, sparse: true },
     name: { type: String, required: true },
+    title: { type: String },
+    firstName: { type: String },
+    middleName: { type: String },
+    lastName: { type: String },
+    company: { type: String },
     phone: { type: String },
+    mobile: { type: String },
     email: { type: String },
     address: { type: String },
     city: { type: String },
     specialization: { type: String },
+    // Work this karigar / vendor does, e.g. ["body_making", "stone_setting"].
+    roles: { type: [String], default: undefined },
+    // Agreed labour per stone (PKR) by difficulty.
+    bodyMakingRates: { type: { simple: Number, mix: Number, difficult: Number }, default: undefined, _id: false },
+    stoneSettingRates: { type: { simple: Number, mix: Number, difficult: Number }, default: undefined, _id: false },
+    // Agreed wastage % per metal, e.g. [{ metal: "Gold 22K", wastage: 5 }].
+    metalWastage: { type: [{ metal: String, wastage: Number, _id: false }], default: undefined },
     isActive: { type: Boolean, default: true },
     notes: { type: String },
     createdBy: { type: Number },
@@ -1436,7 +1449,10 @@ export async function getProductCollections(productId: number) {
 export async function getAllVendors(filters?: { search?: string; isActive?: boolean }) {
   await connectDb();
   const query: Record<string, unknown> = {};
-  if (filters?.search) query.name = { $regex: escapeRegex(filters.search), $options: "i" };
+  if (filters?.search) {
+    const pattern = { $regex: escapeRegex(filters.search), $options: "i" };
+    query.$or = [{ name: pattern }, { company: pattern }, { code: pattern }, { phone: pattern }, { mobile: pattern }];
+  }
   if (filters?.isActive !== undefined) query.isActive = filters.isActive;
   const vendors = await VendorModel.find(query).sort({ createdAt: -1, id: -1 }).lean();
   return toRows(vendorsTable, vendors);

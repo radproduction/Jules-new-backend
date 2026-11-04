@@ -120,6 +120,57 @@ const optionalDate = z.string().optional().refine(
   "Invalid date"
 );
 
+// ---- Vendors (karigar) form ----
+const VENDOR_ROLES = [
+  "body_making", "stringing", "stone_making", "stone_setting", "fitting", "designing", "electroplating", "polishing", "repairing",
+] as const;
+const VENDOR_ROLE_LABELS: Record<(typeof VENDOR_ROLES)[number], string> = {
+  body_making: "Body Making", stringing: "Stringing", stone_making: "Stone Making", stone_setting: "Stone Setting", fitting: "Fitting",
+  designing: "Designing", electroplating: "Electroplating", polishing: "Polishing", repairing: "Repairing",
+};
+const optionalText = z.string().trim().max(500).optional();
+const rateSet = z.object({
+  simple: z.number().min(0).optional(),
+  mix: z.number().min(0).optional(),
+  difficult: z.number().min(0).optional(),
+}).optional();
+const vendorFields = z.object({
+  title: z.string().trim().max(10).optional(),
+  firstName: optionalText,
+  middleName: optionalText,
+  lastName: optionalText,
+  company: optionalText,
+  phone: optionalText,
+  mobile: optionalText,
+  email: optionalText,
+  address: z.string().trim().max(1000).optional(),
+  city: optionalText,
+  specialization: optionalText,
+  notes: z.string().max(2000).optional(),
+  roles: z.array(z.enum(VENDOR_ROLES)).optional(),
+  bodyMakingRates: rateSet,
+  stoneSettingRates: rateSet,
+  metalWastage: z.array(z.object({ metal: z.string().trim().min(1).max(60), wastage: z.number().min(0).max(100) })).max(20).optional(),
+});
+
+/** Display name from the name parts (falls back to company); specialization mirrors the roles. */
+function vendorData(input: Record<string, any>, changed?: string[]) {
+  const parts = [input.firstName, input.middleName, input.lastName].map(part => String(part ?? "").trim()).filter(Boolean);
+  const fromParts = parts.length ? [input.title, ...parts].filter(Boolean).join(" ") : "";
+  const name = String(input.name ?? "").trim() && !parts.length ? String(input.name).trim() : fromParts || String(input.company ?? "").trim() || String(input.name ?? "").trim();
+  if (!name) throw new TRPCError({ code: "BAD_REQUEST", message: "Enter the vendor's first name (or company)" });
+  const out: Record<string, unknown> = { name };
+  const keys = changed ?? Object.keys(input);
+  for (const key of keys) {
+    if (key === "name" || key === "id" || key === "isActive" || !(key in vendorFields.shape)) continue;
+    out[key] = input[key];
+  }
+  if (Array.isArray(input.roles) && (!changed || changed.includes("roles"))) {
+    out.specialization = input.roles.map((role: (typeof VENDOR_ROLES)[number]) => VENDOR_ROLE_LABELS[role]).join(", ") || input.specialization;
+  }
+  return out;
+}
+
 export const appRouter = router({
   system: systemRouter,
   access: accessRouter,
@@ -813,36 +864,23 @@ export const appRouter = router({
       }),
     
     create: operationsFinanceProcedure
-      .input(z.object({
-        name: z.string().min(1),
-        phone: z.string().optional(),
-        email: z.string().optional(),
-        address: z.string().optional(),
-        city: z.string().optional(),
-        specialization: z.string().optional(),
-        notes: z.string().optional(),
-      }))
+      .input(vendorFields.extend({ name: z.string().trim().optional() }))
       .mutation(async ({ input, ctx }) => {
-        const vendor = await db.createVendor({ ...input, createdBy: ctx.user.id });
+        const vendor = await db.createVendor({ ...vendorData(input), createdBy: ctx.user.id });
         await financeDb.ensureVendorLedger(vendor.id, ctx.user.id);
         return vendor;
       }),
     
     update: operationsFinanceProcedure
-      .input(z.object({
-        id: z.number(),
-        name: z.string().min(1).optional(),
-        phone: z.string().optional(),
-        email: z.string().optional(),
-        address: z.string().optional(),
-        city: z.string().optional(),
-        specialization: z.string().optional(),
-        notes: z.string().optional(),
-        isActive: z.boolean().optional(),
-      }))
+      .input(vendorFields.partial().extend({ id: z.number(), name: z.string().trim().optional(), isActive: z.boolean().optional() }))
       .mutation(async ({ input, ctx }) => {
-        const { id, ...data } = input;
-        const vendor = await db.updateVendor(id, data);
+        const { id, isActive, ...data } = input;
+        const current = await db.getVendorById(id);
+        if (!current) throw new TRPCError({ code: "NOT_FOUND", message: "Vendor not found" });
+        const vendor = await db.updateVendor(id, {
+          ...vendorData({ ...(current as any), ...data }, Object.keys(data)),
+          ...(isActive !== undefined ? { isActive } : {}),
+        });
         if (!vendor) throw new TRPCError({ code: "NOT_FOUND", message: "Vendor not found" });
         await financeDb.ensureVendorLedger(id, ctx.user.id);
         await financeDb.syncVendorLedger(id);

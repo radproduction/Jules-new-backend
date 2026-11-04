@@ -75,6 +75,7 @@ const LedgerAccountSchema = new Schema(
     // One ledger per customer / vendor (sparse: only entity ledgers carry these ids).
     customerId: { type: Number, unique: true, sparse: true },
     vendorId: { type: Number, unique: true, sparse: true },
+    staffUserId: { type: Number, unique: true, sparse: true },
     openingBalance: { type: Number, default: 0 },
     openingBalanceSide: { type: String, enum: ["debit", "credit"], default: "debit" },
     isInventory: { type: Boolean, default: false },
@@ -158,6 +159,7 @@ type LedgerDoc = {
   parentId?: number | null;
   customerId?: number | null;
   vendorId?: number | null;
+  staffUserId?: number | null;
   openingBalance?: number | null;
   openingBalanceSide: "debit" | "credit";
   isInventory?: boolean;
@@ -208,6 +210,7 @@ const SYSTEM_ACCOUNTS: SystemAccount[] = [
   { code: "CA000002", title: "Bank Account", description: "Primary bank account", accountClass: "asset", ledgerType: "detail", openingBalanceSide: "debit", isSystem: true, isActive: true, parentCode: "CA000000" },
   { code: "CA000003", title: "Online", description: "Online transfers / digital wallets (IBFT, JazzCash, Easypaisa)", accountClass: "asset", ledgerType: "detail", openingBalanceSide: "debit", isSystem: true, isActive: true, parentCode: "CA000000" },
   { code: "VN000000", title: "Vendor Account", description: "Vendor detail-ledger control", accountClass: "liability", ledgerType: "control", openingBalanceSide: "credit", isSystem: true, isActive: true },
+  { code: "SF000000", title: "Staff Account", description: "Staff / employee detail-ledger control (advances, salaries)", accountClass: "asset", ledgerType: "control", openingBalanceSide: "debit", isSystem: true, isActive: true },
   { code: "EX000000", title: "Expense", description: "Expense control account", accountClass: "expense", ledgerType: "control", openingBalanceSide: "debit", isSystem: true, isActive: true },
   { code: "EX000001", title: "Discount Allowed", description: "Customer discounts and adjustments", accountClass: "expense", ledgerType: "detail", openingBalanceSide: "debit", isSystem: true, isActive: true, parentCode: "EX000000" },
   { code: "EX000002", title: "General Expense", description: "General operating expenses", accountClass: "expense", ledgerType: "detail", openingBalanceSide: "debit", isSystem: true, isActive: true, parentCode: "EX000000" },
@@ -242,7 +245,7 @@ export function centsToMoney(cents: number) {
   return (cents / 100).toFixed(2);
 }
 
-function formatEntityCode(prefix: "CS" | "VN", id: number) {
+function formatEntityCode(prefix: "CS" | "VN" | "SF", id: number) {
   return `${prefix}${String(id).padStart(6, "0")}`;
 }
 
@@ -369,16 +372,19 @@ export async function ensureFinanceSetup(userId?: number) {
   await ensureSystemAccounts(userId);
 
   // Create any missing customer / vendor detail ledgers.
-  const [customerLedgerIds, vendorLedgerIds] = await Promise.all([
+  const [customerLedgerIds, vendorLedgerIds, staffLedgerIds] = await Promise.all([
     LedgerAccountModel.distinct("customerId", { customerId: { $ne: null } }),
     LedgerAccountModel.distinct("vendorId", { vendorId: { $ne: null } }),
+    LedgerAccountModel.distinct("staffUserId", { staffUserId: { $ne: null } }),
   ]);
-  const [missingCustomers, missingVendors] = await Promise.all([
+  const [missingCustomers, missingVendors, missingStaff] = await Promise.all([
     CustomerModel.find({ id: { $nin: customerLedgerIds } }, { id: 1 }).lean(),
     VendorModel.find({ id: { $nin: vendorLedgerIds } }, { id: 1 }).lean(),
+    UserModel.find({ id: { $nin: staffLedgerIds } }, { id: 1 }).lean(),
   ]);
   for (const customer of missingCustomers) await ensureCustomerLedger(customer.id, userId);
   for (const vendor of missingVendors) await ensureVendorLedger(vendor.id, userId);
+  for (const staff of missingStaff) await ensureStaffLedger(staff.id as number, userId);
 
   setupComplete = true;
   return { success: true } as const;
@@ -389,13 +395,13 @@ async function ensureSetupOnce(userId?: number) {
   if (!setupComplete) await ensureFinanceSetup(userId);
 }
 
-async function requireControlAccount(code: "CS000000" | "VN000000", userId?: number) {
+async function requireControlAccount(code: "CS000000" | "VN000000" | "SF000000", userId?: number) {
   let parent = await getAccountByCode(code);
   if (!parent) {
     await ensureSystemAccounts(userId);
     parent = await getAccountByCode(code);
   }
-  if (!parent) throw new Error(`${code === "CS000000" ? "Customer" : "Vendor"} control account is unavailable`);
+  if (!parent) throw new Error(`${code === "CS000000" ? "Customer" : code === "VN000000" ? "Vendor" : "Staff"} control account is unavailable`);
   return parent;
 }
 
@@ -460,6 +466,38 @@ export async function ensureVendorLedger(vendorId: number, userId?: number) {
       createdBy: userId,
     },
     { vendorId },
+    { allowCodeSuffix: true }
+  );
+  return ledgerRow(created);
+}
+
+/** One ledger per staff user (salary, advances, petty cash given to them). */
+export async function ensureStaffLedger(staffUserId: number, userId?: number) {
+  await connectDb();
+  const existing = await LedgerAccountModel.findOne({ staffUserId }).lean<LedgerDoc>();
+  if (existing) return ledgerRow(existing);
+
+  const staff = await UserModel.findOne({ id: staffUserId }).lean();
+  if (!staff) throw new Error("User not found");
+  const parent = await requireControlAccount("SF000000", userId);
+  const name = String(staff.name || staff.email || `User ${staffUserId}`);
+
+  const created = await insertLedger(
+    {
+      code: await uniqueEntityCode(formatEntityCode("SF", staffUserId)),
+      title: name,
+      description: `Staff account for ${name}`,
+      accountClass: "asset",
+      ledgerType: "detail",
+      parentId: parent.id,
+      staffUserId,
+      openingBalance: 0,
+      openingBalanceSide: "debit",
+      isSystem: true,
+      isActive: staff.isActive !== false,
+      createdBy: userId,
+    },
+    { staffUserId },
     { allowCodeSuffix: true }
   );
   return ledgerRow(created);
